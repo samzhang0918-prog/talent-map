@@ -1,0 +1,23 @@
+# 这个目录里同时放着好几个不相关的项目，所以用白名单模式：
+# 先忽略一切，再逐个放行本项目需要的文件。这样新增任何文件都不会被误提交。
+/*
+
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/app.py
+!/topic_graph.py
+!/talent_map_by_topic.py
+
+# vis-network 前端库（本地提供，避免 CDN 被网络环境挡住时页面整个空白）
+!/lib/
+/lib/*
+!/lib/vis-9.1.2/
+/lib/vis-9.1.2/*
+!/lib/vis-9.1.2/vis-network.min.js
+!/lib/vis-9.1.2/vis-network.css
+
+# 保险起见再显式排一遍这些
+.DS_Store
+__pycache__/
+*.pyc
