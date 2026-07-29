@@ -120,3 +120,10 @@ export OPENALEX_MAILTO="your@email.com"
 | `topic_graph.py` | 检索、建图、聚类、数据补充的核心逻辑 |
 | `talent_map_by_topic.py` | 命令行版，生成静态 HTML |
 | `lib/` | vis-network 前端库（本地提供，避免 CDN 不可达时页面空白） |
+
+## 许可
+
+[MIT](LICENSE)
+
+本项目仅使用 dblp 与 OpenAlex 的公开学术数据。这些数据各自的使用条款以其官方说明为准，
+MIT 许可仅适用于本仓库的代码。
