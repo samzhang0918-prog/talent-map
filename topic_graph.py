@@ -19,6 +19,7 @@
 import colorsys
 import os
 import re
+import threading
 import time
 import unicodedata
 import urllib.parse
@@ -56,6 +57,28 @@ SESSION.headers.update({
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 })
 
+# Web 应用给每个搜索请求单独开一个线程（见 app.py 的 worker），如果限速只在各自
+# 线程里 sleep，N 个人同时搜就等于把 dblp 的请求频率放大 N 倍——集体违反了
+# robots.txt 的 Crawl-delay: 4，而且被限的是出口 IP，会连累所有使用者。
+# 所以把节流做成进程级的：全局同一时刻只允许一个 dblp 请求在飞，且与上一个请求
+# 至少间隔 min_gap 秒。单人使用时行为跟原来完全一致（等待量为 0）。
+_DBLP_GATE = threading.Lock()
+_DBLP_LAST = 0.0
+
+
+def dblp_get(url, min_gap, timeout=30):
+    """按全局节奏发一个 dblp 请求。并发调用会自动排队，不会叠加请求频率。"""
+    global _DBLP_LAST
+    with _DBLP_GATE:
+        wait = min_gap - (time.monotonic() - _DBLP_LAST)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            return SESSION.get(url, timeout=timeout)
+        finally:
+            # 以请求"结束"时刻计时，宁可比 Crawl-delay 更保守
+            _DBLP_LAST = time.monotonic()
+
 
 def fetch_page(query, offset, max_retries=5):
     """
@@ -67,7 +90,7 @@ def fetch_page(query, offset, max_retries=5):
     url = f"{DBLP_API}?q={urllib.parse.quote_plus(query)}&format=json&h={PAGE_SIZE}&f={offset}"
     for attempt in range(max_retries):
         try:
-            resp = SESSION.get(url, timeout=30)
+            resp = dblp_get(url, CRAWL_DELAY)
             if resp.status_code == 200:
                 hits = resp.json()["result"]["hits"]
                 return hits.get("hit", []), int(hits.get("@total", 0))
@@ -117,8 +140,7 @@ def collect_papers(query, max_papers, on_progress=None):
         if len(hits) < PAGE_SIZE:
             break
         offset += PAGE_SIZE
-        if offset < min(max_papers, MAX_OFFSET):
-            time.sleep(CRAWL_DELAY)
+        # 翻页间隔由 dblp_get 的全局节流统一负责，这里不再单独 sleep
 
     return papers, (total or 0)
 
@@ -380,7 +402,7 @@ def fetch_author_papers(name, max_retries=3):
     url = f"{DBLP_API}?q={urllib.parse.quote_plus(name)}&format=json&h={PAGE_SIZE}"
     for attempt in range(max_retries):
         try:
-            resp = SESSION.get(url, timeout=30)
+            resp = dblp_get(url, SNOWBALL_DELAY)
             if resp.status_code == 200:
                 return resp.json()["result"]["hits"].get("hit", [])
             time.sleep(SNOWBALL_DELAY * (attempt + 1))
@@ -448,8 +470,7 @@ def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None):
                            citations=0, institution="", topics=[])
             S.add_edge(pid, p, weight=w)
 
-        if done < len(seeds):
-            time.sleep(SNOWBALL_DELAY)
+        # 种子之间的间隔同样交给 dblp_get 的全局节流
 
     # 种子之间在原方向图里已有的合作关系也要保留，否则会丢掉真实的边
     for a, b, d in G.edges(data=True):
