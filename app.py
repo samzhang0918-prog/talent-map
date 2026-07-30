@@ -491,6 +491,7 @@ function render(data) {
     return {
       id: n.id, label: n.label, color: n.color, size: sizeById[n.id], community: n.community,
       title: head + extra + '<br>dblp: ' + n.id + (samples ? '<br><br>代表作:<br>' + samples : '')
+        + '<br><br><i>点击跳转 Google Scholar</i>'
     };
   }));
   edgesDS = new vis.DataSet(data.edges.map(function (e) {
@@ -512,6 +513,19 @@ function render(data) {
                    springLength: 70, springConstant: 0.05, damping: 0.5 }
     },
     interaction: { hover: true, tooltipDelay: 120 }
+  });
+
+  // dblp 不提供作者的 Google Scholar 主页链接，也没有可靠的第三方 API 能把姓名
+  // 精确映射到某个 Scholar profile（同名学者很常见）。所以不去猜一个具体链接，
+  // 而是跳转到 Google Scholar 的"作者搜索"结果页，让用户自己从候选里选——
+  // 带上机构信息（如果有）帮助缩小范围，但不保证第一个结果就是本人。
+  network.on('click', function (params) {
+    if (!params.nodes.length) return;
+    var n = allNodes.find(function (x) { return x.id === params.nodes[0]; });
+    if (!n) return;
+    var q = '"' + n.label + '"' + (n.institution ? ' "' + n.institution + '"' : '');
+    window.open('https://scholar.google.com/citations?view_op=search_authors&mauthors='
+      + encodeURIComponent(q), '_blank', 'noopener');
   });
 
   modified = []; activeCid = null; activeInst = null;
