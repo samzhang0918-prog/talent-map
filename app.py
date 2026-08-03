@@ -53,6 +53,26 @@ _INFLIGHT_IPS = set()
 _INFLIGHT_LOCK = threading.Lock()
 
 
+def get_client_ip(request):
+    """
+    取访客的真实 IP，而不是反向代理自己的 IP。
+
+    部署在 Render / Hugging Face Spaces（或者本地用 cloudflared 隧道分享）时，
+    uvicorn 接到的 TCP 连接来自平台的反向代理，request.client.host 拿到的是
+    那个代理的地址——所有访客在这个值上看起来都是同一个人，会让"同一访客不能
+    并发检索"这条限制误伤成"全站同一时刻只能有一个人在搜"。
+    反向代理转发时通常会把真实来源写进 X-Forwarded-For（可能有多级，取第一个，
+    即离真实访客最近的那个）；没有这个头时说明是直连（比如本地不经隧道直接
+    访问），退回 request.client.host。
+    这个值是访客自己可控的请求头，伪造后最多是绕开这条限速优化，不涉及权限
+    或数据安全，可以接受。
+    """
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 def cache_get(key):
     with _CACHE_LOCK:
         hit = _CACHE.get(key)
@@ -97,7 +117,7 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
     papers = max(100, min(papers, PUBLIC_MAX_PAPERS))
     min_papers = max(1, min(min_papers, 20))
     seeds = max(3, min(seeds, PUBLIC_MAX_SEEDS))
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = get_client_ip(request)
 
     async def event_stream():
         if not q:
@@ -186,7 +206,11 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        # no-transform：明确告诉中间代理/CDN 不要重新压缩或缓冲这个响应体。
+        # Render 部署时前面套了 Cloudflare，如果它对 text/event-stream 做了
+        # 压缩缓冲，进度事件会被攒起来一次性吐出，SSE 就失去了实时推送的意义
+        # （极端情况下甚至会在客户端超时之前完全收不到任何字节）。
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
 
 
