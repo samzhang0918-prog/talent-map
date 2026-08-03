@@ -104,8 +104,14 @@ def fetch_page(query, offset, max_retries=5):
             if resp.status_code == 200:
                 hits = resp.json()["result"]["hits"]
                 return hits.get("hit", []), int(hits.get("@total", 0))
+            # 临时诊断日志：定位公开部署后 dblp 持续失败到底是什么原因
+            # （403 封禁 / 429 限流 / 500 抽风，处理方式完全不同）。
+            print(f"[dblp] 第 {attempt+1}/{max_retries} 次失败 status={resp.status_code} "
+                  f"body={resp.text[:200]!r}", flush=True)
             time.sleep(CRAWL_DELAY * (attempt + 1))
-        except (requests.RequestException, ValueError, KeyError):
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            print(f"[dblp] 第 {attempt+1}/{max_retries} 次异常 "
+                  f"{type(exc).__name__}: {exc}", flush=True)
             time.sleep(CRAWL_DELAY * (attempt + 1))
     return None, None
 
