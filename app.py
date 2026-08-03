@@ -120,6 +120,13 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
     client_ip = get_client_ip(request)
 
     async def event_stream():
+        # 临时诊断日志：定位"公开部署后检索接口收不到数据"是卡在哪一段。
+        # uvicorn 默认 log_level=warning 不打请求日志，之前 Render 的 Logs
+        # 里完全看不出请求有没有到、走到哪一步了，所以这里手动打印。
+        # flush=True 是因为容器里 stdout 对非 tty 是整块缓冲的，不强制 flush
+        # 打印可能压根不出现在平台的日志面板里。
+        print(f"[search] 收到请求 ip={client_ip} q={q!r} papers={papers} deep={deep}", flush=True)
+
         if not q:
             yield sse("error", {"message": "请输入方向关键词"})
             return
@@ -138,6 +145,7 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
 
             def make_reporter(event_name):
                 def report(done_n, total_n, message):
+                    print(f"[search] progress ip={client_ip} {event_name}: {message}", flush=True)
                     loop.call_soon_threadsafe(
                         queue.put_nowait,
                         (event_name, {"fetched": done_n, "done": done_n,
@@ -174,14 +182,19 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
                     loop.call_soon_threadsafe(queue.put_nowait, ("deep_result", deep_res))
                     loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
                 except Exception as exc:
+                    import traceback
+                    print(f"[search] worker 异常 ip={client_ip}: {exc}", flush=True)
+                    traceback.print_exc()
                     loop.call_soon_threadsafe(
                         queue.put_nowait, ("fast_result", {"error": f"检索出错：{exc}"}))
                     loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
 
             threading.Thread(target=worker, daemon=True).start()
+            print(f"[search] worker 线程已启动 ip={client_ip}，开始等待队列消息", flush=True)
 
             while True:
                 kind, data = await queue.get()
+                print(f"[search] 从队列取到事件 ip={client_ip} kind={kind}", flush=True)
                 if kind in ("progress", "deep_progress"):
                     yield sse(kind, data)
                 elif kind == "fast_result":
@@ -808,4 +821,6 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     print("人才地图 Web 应用启动中...")
     print(f"浏览器打开: http://127.0.0.1:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    # 临时调到 info：warning 级别不打请求访问日志，公开部署排障时看不出请求
+    # 有没有到、卡在哪一步。
+    uvicorn.run(app, host=host, port=port, log_level="info")

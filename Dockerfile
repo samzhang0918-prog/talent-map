@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+# Python 对非 tty 的 stdout 是整块缓冲的，容器里不加这个的话 print() 打的诊断
+# 日志可能要等缓冲区攒满才会出现在平台的日志面板里，公开部署排障时非常致命。
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 COPY requirements.txt .
