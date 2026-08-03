@@ -23,7 +23,7 @@ import time
 import os
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -42,6 +42,15 @@ if os.path.isdir(_LIB_DIR):
 _CACHE = {}
 _CACHE_TTL = 30 * 60
 _CACHE_LOCK = threading.Lock()
+
+# 公开部署时的参数上限，比 topic_graph 里 dblp 自身的技术上限（10000 篇 / 40 秒子）
+# 收紧很多——见 /api/search 里的注释。
+PUBLIC_MAX_PAPERS = 2000
+PUBLIC_MAX_SEEDS = 15
+
+# 正在检索中的访客 IP，用来拒绝同一个人开多个并发检索（见 /api/search）。
+_INFLIGHT_IPS = set()
+_INFLIGHT_LOCK = threading.Lock()
 
 
 def cache_get(key):
@@ -65,7 +74,7 @@ def strip_internal(payload):
 
 
 @app.get("/api/search")
-async def search(q: str, papers: int = 300, min_papers: int = 2,
+async def search(request: Request, q: str, papers: int = 300, min_papers: int = 2,
                  deep: bool = False, seeds: int = 10):
     """
     SSE 流式接口：边抓边推进度，最后推完整结果。
@@ -82,78 +91,97 @@ async def search(q: str, papers: int = 300, min_papers: int = 2,
     比让人对着转圈等两分钟好得多。
     """
     q = (q or "").strip()
-    papers = max(100, min(papers, topic_graph.MAX_OFFSET))
+    # 公开部署时把上限收紧一些：papers=10000 (dblp 硬上限) 单次要抓 7 分钟以上，
+    # seeds=40 的深度模式要跑将近 4 分钟，一个访客就能把全局节流闸占满，
+    # 让其他人排很久的队。命令行版（talent_map_by_topic.py）不走这个接口，不受影响。
+    papers = max(100, min(papers, PUBLIC_MAX_PAPERS))
     min_papers = max(1, min(min_papers, 20))
-    seeds = max(3, min(seeds, 40))
+    seeds = max(3, min(seeds, PUBLIC_MAX_SEEDS))
+    client_ip = request.client.host if request.client else "unknown"
 
     async def event_stream():
         if not q:
             yield sse("error", {"message": "请输入方向关键词"})
             return
 
-        queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-
-        def make_reporter(event_name):
-            def report(done_n, total_n, message):
-                loop.call_soon_threadsafe(
-                    queue.put_nowait,
-                    (event_name, {"fetched": done_n, "done": done_n,
-                                  "total": total_n, "message": message}),
-                )
-            return report
-
-        # 抓取是同步阻塞的（requests + time.sleep），必须放到线程里跑，
-        # 否则会卡住整个事件循环，连已经产生的进度都推不出去。
-        def worker():
-            try:
-                fast_key = f"{q}|{papers}|{min_papers}"
-                fast = cache_get(fast_key)
-                if fast is None:
-                    fast = topic_graph.search_topic(
-                        q, papers, min_papers, make_reporter("progress"))
-                    if not fast.get("error"):
-                        cache_put(fast_key, fast)
-                else:
-                    make_reporter("progress")(0, 0, "命中缓存，直接返回")
-
-                loop.call_soon_threadsafe(queue.put_nowait, ("fast_result", fast))
-                if fast.get("error") or not deep:
-                    loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
-                    return
-
-                deep_key = f"{q}|{papers}|{min_papers}|deep{seeds}"
-                deep_res = cache_get(deep_key)
-                if deep_res is None:
-                    deep_res = topic_graph.deep_expand(
-                        fast, seeds, on_progress=make_reporter("deep_progress"))
-                    if not deep_res.get("error"):
-                        cache_put(deep_key, deep_res)
-                loop.call_soon_threadsafe(queue.put_nowait, ("deep_result", deep_res))
-                loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
-            except Exception as exc:
-                loop.call_soon_threadsafe(
-                    queue.put_nowait, ("fast_result", {"error": f"检索出错：{exc}"}))
-                loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-        while True:
-            kind, data = await queue.get()
-            if kind in ("progress", "deep_progress"):
-                yield sse(kind, data)
-            elif kind == "fast_result":
-                if data.get("error"):
-                    yield sse("error", {"message": data["error"]})
-                else:
-                    yield sse("done", strip_internal(data))
-            elif kind == "deep_result":
-                if data.get("error"):
-                    yield sse("deep_error", {"message": data["error"]})
-                else:
-                    yield sse("deep_done", strip_internal(data))
-            else:
+        # 同一访客不能同时开好几个检索：dblp 请求是全局串行的（见 topic_graph.dblp_get），
+        # 一个人开几个标签页会把队列占满，让其他访客等更久。
+        with _INFLIGHT_LOCK:
+            if client_ip in _INFLIGHT_IPS:
+                yield sse("error", {"message": "你有一个检索还在进行中，请等它结束后再发起新的搜索"})
                 return
+            _INFLIGHT_IPS.add(client_ip)
+
+        try:
+            queue: asyncio.Queue = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def make_reporter(event_name):
+                def report(done_n, total_n, message):
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait,
+                        (event_name, {"fetched": done_n, "done": done_n,
+                                      "total": total_n, "message": message}),
+                    )
+                return report
+
+            # 抓取是同步阻塞的（requests + time.sleep），必须放到线程里跑，
+            # 否则会卡住整个事件循环，连已经产生的进度都推不出去。
+            def worker():
+                try:
+                    fast_key = f"{q}|{papers}|{min_papers}"
+                    fast = cache_get(fast_key)
+                    if fast is None:
+                        fast = topic_graph.search_topic(
+                            q, papers, min_papers, make_reporter("progress"))
+                        if not fast.get("error"):
+                            cache_put(fast_key, fast)
+                    else:
+                        make_reporter("progress")(0, 0, "命中缓存，直接返回")
+
+                    loop.call_soon_threadsafe(queue.put_nowait, ("fast_result", fast))
+                    if fast.get("error") or not deep:
+                        loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
+                        return
+
+                    deep_key = f"{q}|{papers}|{min_papers}|deep{seeds}"
+                    deep_res = cache_get(deep_key)
+                    if deep_res is None:
+                        deep_res = topic_graph.deep_expand(
+                            fast, seeds, on_progress=make_reporter("deep_progress"))
+                        if not deep_res.get("error"):
+                            cache_put(deep_key, deep_res)
+                    loop.call_soon_threadsafe(queue.put_nowait, ("deep_result", deep_res))
+                    loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
+                except Exception as exc:
+                    loop.call_soon_threadsafe(
+                        queue.put_nowait, ("fast_result", {"error": f"检索出错：{exc}"}))
+                    loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+            while True:
+                kind, data = await queue.get()
+                if kind in ("progress", "deep_progress"):
+                    yield sse(kind, data)
+                elif kind == "fast_result":
+                    if data.get("error"):
+                        yield sse("error", {"message": data["error"]})
+                    else:
+                        yield sse("done", strip_internal(data))
+                elif kind == "deep_result":
+                    if data.get("error"):
+                        yield sse("deep_error", {"message": data["error"]})
+                    else:
+                        yield sse("deep_done", strip_internal(data))
+                else:
+                    return
+        finally:
+            # 无论正常结束、报错还是访客中途关掉页面（StreamingResponse 会把
+            # GeneratorExit 抛进这个生成器），都要把这个 IP 从"占用中"里摘掉，
+            # 否则一次异常断开就会把这个人永久卡在"检索进行中"的错误提示里。
+            with _INFLIGHT_LOCK:
+                _INFLIGHT_IPS.discard(client_ip)
 
     return StreamingResponse(
         event_stream(),
@@ -749,6 +777,11 @@ $('nodeSearch').addEventListener('input', function (e) {
 
 
 if __name__ == "__main__":
+    # 部署到容器时（Hugging Face Spaces / Render 等）平台会通过 PORT 环境变量
+    # 指定端口，且必须监听 0.0.0.0 才能被外部访问；本地不设置时仍然默认 8000，
+    # 行为跟原来一样。
+    port = int(os.environ.get("PORT", 8000))
+    host = os.environ.get("HOST", "0.0.0.0")
     print("人才地图 Web 应用启动中...")
-    print("浏览器打开: http://127.0.0.1:8000")
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+    print(f"浏览器打开: http://127.0.0.1:{port}")
+    uvicorn.run(app, host=host, port=port, log_level="warning")

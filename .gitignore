@@ -6,6 +6,7 @@
 !/LICENSE
 !/README.md
 !/requirements.txt
+!/Dockerfile
 !/app.py
 !/topic_graph.py
 !/talent_map_by_topic.py

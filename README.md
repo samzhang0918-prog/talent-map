@@ -13,6 +13,9 @@
 - **节点大小可切换**：按发文量看谁产出多，按引用量看谁影响力大——两种口径的排序往往差别很大
 - **机构分布**：列出机构及人数，点击可高亮该机构的学者
 - **深度模式**：把散落的研究组连成一张连通网络（见下文）
+- **跳转 Google Scholar**：点击图上任意一个学者节点，新标签页打开该学者的 Google
+  Scholar 作者搜索结果（带姓名和机构，帮助缩小范围——dblp 没有 Scholar 主页链接，
+  姓名到 profile 没有可靠的精确映射，所以是搜索结果页而不是直接跳到某个具体页面）
 
 ## 安装
 
@@ -29,6 +32,50 @@ python3 app.py
 ```
 
 然后打开 http://127.0.0.1:8000
+
+### 公开部署（让别人不用你开着电脑也能访问）
+
+这个应用是 SSE 长连接、深度模式单次检索能跑几分钟，Vercel / Netlify /
+Cloudflare Workers 这类 serverless 平台都有几十秒的执行时间上限，检索到一半
+就会被掐断，所以只能部署到常驻容器平台。推荐 **[Hugging Face
+Spaces](https://huggingface.co/new-space)**（免费常驻、Docker SDK 直接能跑、
+受众也是学术圈），Render / Fly.io / Railway 这些同样能用同一个 Dockerfile。
+
+仓库根目录带了 `Dockerfile`，本地验证：
+
+```bash
+docker build -t talent-map .
+docker run -p 7860:7860 -e OPENALEX_MAILTO="you@example.com" talent-map
+```
+
+部署到 Hugging Face Spaces：
+
+1. 打开 [huggingface.co/new-space](https://huggingface.co/new-space)，SDK 选
+   **Docker**，关联这个 GitHub 仓库（或者 `git remote add hf <space 地址>` 后
+   `git push hf main`）
+2. 在 Space 的 Settings → Variables and secrets 里按需加：
+   - `OPENALEX_MAILTO`：你的邮箱，不设也能用，只是配额更保守
+   - `CONTACT_URL`：能联系到你的一个链接，会附在请求的 User-Agent 里——公开
+     长期跑之后请求量不再是偶发的自用流量，让 dblp/OpenAlex 出问题时能找到人，
+     而不是直接封 IP
+3. Space 会自动 build 这个 Dockerfile，几分钟后给你一个固定公网网址
+
+跟"本地 + cloudflared 隧道临时分享"（见上面 `python3 app.py` 那种用法）的区别：
+隧道网址每次重启都变、你关电脑就失效，适合发给几个人临时试用；公开部署网址固定
+长期有效，电脑不用开着，适合真的想让不特定的人都能访问。
+
+公开部署时几处内建的保护机制：
+
+| 机制 | 做什么 | 为什么 |
+|---|---|---|
+| 全局 dblp 节流 | 同一时刻整个进程只有一个 dblp 请求在飞 | 访客多的时候如果各自独立限速，叠加起来会集体触发 dblp 的限流，一个人被封连累所有人 |
+| 单访客并发限制 | 同一 IP 有检索在跑时，新请求会被拒绝并提示稍等 | 防止一个人开好几个标签页占满上面这条全局队列 |
+| 参数上限收紧 | `papers` 上限从 dblp 的技术上限 10000 降到 2000，`seeds` 从 40 降到 15 | 不收紧的话一次请求能占住队列 7~9 分钟，命令行版不受此限制 |
+| OpenAlex 配额降级 | 每天 1000 credits 是全站共享的，用完后引用数/机构补充会静默跳过 | 不影响检索本身，只是那部分数据缺失——界面本来就如实标注覆盖率，不会误导成"没有" |
+
+以及一条限制：进程内缓存（30 分钟 TTL）只在单实例里有效，**只能部署单副本**
+（`--workers 1` 或平台默认的单实例设置），开多副本会让缓存命中率下降、
+连带把 dblp 压力推高。
 
 ### 命令行版（生成静态 HTML 文件）
 
@@ -120,6 +167,7 @@ export OPENALEX_MAILTO="your@email.com"
 | `topic_graph.py` | 检索、建图、聚类、数据补充的核心逻辑 |
 | `talent_map_by_topic.py` | 命令行版，生成静态 HTML |
 | `lib/` | vis-network 前端库（本地提供，避免 CDN 不可达时页面空白） |
+| `Dockerfile` | 公开部署用（Hugging Face Spaces / Render 等），见上文"公开部署" |
 
 ## 许可
 

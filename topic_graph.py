@@ -52,9 +52,19 @@ PRESET_TOPICS = [
 ]
 
 SESSION = requests.Session()
+_UA_CONTACT = os.environ.get("CONTACT_URL", "").strip()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    # 挂到公网长期跑之后，请求量不再是"自用脚本"那种偶发流量，向 dblp/OpenAlex
+    # 表明身份和联系方式是对公开 API 的基本礼貌，出问题时对方也能找到人而不是直接封 IP。
+    # 没配置 CONTACT_URL 时退化成普通浏览器 UA，本地自用不受影响。
+    "User-Agent": (
+        f"talent-map/1.0 (+{_UA_CONTACT}) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ) if _UA_CONTACT else (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
 })
 
 # Web 应用给每个搜索请求单独开一个线程（见 app.py 的 worker），如果限速只在各自
