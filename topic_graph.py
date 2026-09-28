@@ -198,11 +198,20 @@ def enrich_from_openalex(papers, on_progress=None):
             by_doi.setdefault(doi, []).append(p)
 
     if not by_doi:
-        return {}, {"papers_with_doi": 0, "papers_matched": 0}
+        return {}, {
+            "papers_with_doi": 0,
+            "papers_matched": 0,
+            "enrich_status": "skipped",
+            "enrich_message": "这批论文缺少 DOI，无法向 OpenAlex 补充引用/机构",
+            "degraded": False,
+        }
 
     dois = list(by_doi)
     enriched = defaultdict(lambda: {"citations": 0, "institutions": Counter(), "topics": Counter()})
     matched_papers = 0
+    batches_ok = 0
+    batches_fail = 0
+    fail_reasons = []  # e.g. HTTP 429 / network error — surfaced to UI as degraded
 
     for i in range(0, len(dois), OPENALEX_BATCH):
         chunk = dois[i:i + OPENALEX_BATCH]
@@ -216,9 +225,23 @@ def enrich_from_openalex(papers, on_progress=None):
         try:
             resp = SESSION.get(OPENALEX_API, params=params, timeout=40)
             if resp.status_code != 200:
+                batches_fail += 1
+                # Keep a short readable reason; quota exhaustion is the common public-trial case
+                reason = f"HTTP {resp.status_code}"
+                if resp.status_code == 429:
+                    reason = "配额用尽(429)"
+                elif resp.status_code in (401, 403):
+                    reason = f"接口拒绝({resp.status_code})"
+                if reason not in fail_reasons:
+                    fail_reasons.append(reason)
                 continue
             results = resp.json().get("results", [])
-        except (requests.RequestException, ValueError, KeyError):
+            batches_ok += 1
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            batches_fail += 1
+            reason = type(exc).__name__
+            if reason not in fail_reasons:
+                fail_reasons.append(reason)
             continue
 
         for work in results:
@@ -253,10 +276,29 @@ def enrich_from_openalex(papers, on_progress=None):
                         f"正在补充引用量/机构/主题（{min(i + OPENALEX_BATCH, len(dois))}/{len(dois)} 篇）")
         time.sleep(0.3)   # OpenAlex 没有硬性 crawl-delay，但别把请求打太密
 
+    # Status for the UI: main graph stays usable even when enrich degrades.
+    if batches_ok == 0 and batches_fail > 0:
+        enrich_status = "degraded"
+        enrich_message = "引用/机构补充已降级：配额用尽或接口失败（" + "、".join(fail_reasons[:3]) + "）"
+        degraded = True
+    elif batches_fail > 0:
+        enrich_status = "partial"
+        enrich_message = "引用/机构补充部分失败（" + "、".join(fail_reasons[:3]) + "），已展示拿到的部分"
+        degraded = True
+    else:
+        enrich_status = "ok"
+        enrich_message = ""
+        degraded = False
+
     coverage = {
         "papers_total": len(papers),
         "papers_with_doi": len(dois),
         "papers_matched": matched_papers,
+        "enrich_status": enrich_status,
+        "enrich_message": enrich_message,
+        "degraded": degraded,
+        "enrich_batches_ok": batches_ok,
+        "enrich_batches_fail": batches_fail,
     }
     return dict(enriched), coverage
 
@@ -515,7 +557,11 @@ def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=T
         return {"error": f"这批论文涉及 {total_authors} 位作者，但没有人在该方向发过 "
                          f"{min_papers} 篇以上。可以调低「最少发文数」，或调高检索论文数。"}
 
-    coverage = {}
+    coverage = {
+        "enrich_status": "skipped",
+        "enrich_message": "",
+        "degraded": False,
+    }
     if enrich:
         enriched, coverage = enrich_from_openalex(papers, on_progress)
         apply_enrichment(G, enriched)

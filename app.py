@@ -261,6 +261,11 @@ PAGE = """<!DOCTYPE html>
   }
   button:hover:not(:disabled) { background: #a6c8ff; }
   button:disabled { background: #45475a; color: #7f849c; cursor: not-allowed; }
+  .btnSecondary {
+    padding: 6px 12px; font-size: 12px; background: #313244; color: #cdd6f4;
+    border: 1px solid #45475a; border-radius: 4px; cursor: pointer; font-weight: 500;
+  }
+  .btnSecondary:hover { background: #45475a; }
   .opt { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #a6adc8; white-space: nowrap; }
   .opt input { width: 74px; padding: 6px 8px; background: #313244; border: 1px solid #45475a;
                border-radius: 4px; color: #cdd6f4; font-size: 12px; }
@@ -272,14 +277,30 @@ PAGE = """<!DOCTYPE html>
   .tab { flex: 1; padding: 5px 8px; font-size: 12px; text-align: center; cursor: pointer;
          background: #313244; border: 1px solid #45475a; border-radius: 4px; color: #bac2de; }
   .tab.active { background: #45475a; color: #cdd6f4; font-weight: 600; }
+  .viewToggle {
+    display: none; gap: 0; margin-left: 8px; border: 1px solid #45475a; border-radius: 6px; overflow: hidden;
+  }
+  .viewToggle button {
+    padding: 7px 14px; font-size: 12px; background: #313244; color: #bac2de;
+    border: none; border-radius: 0; font-weight: 500;
+  }
+  .viewToggle button.active { background: #45475a; color: #cdd6f4; font-weight: 600; }
   .instItem { display: flex; align-items: center; padding: 5px 6px; border-radius: 4px;
               cursor: pointer; font-size: 12px; }
   .instItem:hover { background: #313244; }
   .instItem.active { background: #45475a; }
-  #deepBanner {
-    position: absolute; top: 16px; left: 50%; transform: translateX(-50%);
-    background: rgba(137,180,250,.14); border: 1px solid #89b4fa; color: #cdd6f4;
+  #deepBanner, #degradeBanner {
+    position: absolute; left: 50%; transform: translateX(-50%);
     padding: 7px 16px; border-radius: 18px; font-size: 12px; z-index: 6; display: none;
+    max-width: min(720px, 90vw); text-align: center;
+  }
+  #deepBanner {
+    top: 16px;
+    background: rgba(137,180,250,.14); border: 1px solid #89b4fa; color: #cdd6f4;
+  }
+  #degradeBanner {
+    top: 52px;
+    background: rgba(249,226,175,.12); border: 1px solid #f9e2af; color: #f9e2af;
   }
   #presets { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
   .chip {
@@ -287,17 +308,67 @@ PAGE = """<!DOCTYPE html>
     border-radius: 20px; cursor: pointer; color: #bac2de;
   }
   .chip:hover { background: #45475a; color: #cdd6f4; }
-  /* min-height:0 + 绝对定位撑满：flex item 的子元素用 height:100% 在部分浏览器里
-     解析不出高度（父元素 height 是 auto，由 flex 算法决定），容器一旦算成 0 高，
-     vis-network 就会画在一块看不见的画布上，页面表现为"图没出来"。 */
+  .chip.suggest { border-color: #89b4fa; color: #89b4fa; }
   main { flex: 1; min-height: 0; position: relative; }
   #graph { position: absolute; inset: 0; }
+  #listView {
+    position: absolute; inset: 0; display: none; flex-direction: column;
+    background: #1e1e2e; z-index: 4; padding: 14px 18px 18px;
+  }
+  #listView.visible { display: flex; }
+  .listToolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .listToolbar .opt input[type="text"] { width: 140px; }
+  .listToolbar .opt input[type="number"] { width: 64px; }
+  .listToolbar label.chk { display: flex; align-items: center; gap: 5px; font-size: 12px; color: #a6adc8; cursor: pointer; }
+  .listMeta { font-size: 12px; color: #a6adc8; margin-left: auto; }
+  .listDisclaimer {
+    font-size: 11px; color: #7f849c; margin-bottom: 8px; line-height: 1.5;
+  }
+  #listTableWrap { flex: 1; min-height: 0; overflow: auto; border: 1px solid #313244; border-radius: 6px; }
+  table.shortlist { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.shortlist th, table.shortlist td {
+    padding: 8px 10px; text-align: left; border-bottom: 1px solid #313244; vertical-align: top;
+  }
+  table.shortlist th {
+    position: sticky; top: 0; background: #181825; color: #a6adc8; font-weight: 600; z-index: 1;
+  }
+  table.shortlist tr:hover td { background: #262637; }
+  table.shortlist a { color: #89b4fa; text-decoration: none; }
+  table.shortlist a:hover { text-decoration: underline; }
+  .gapTag {
+    display: inline-block; padding: 1px 6px; margin: 1px 3px 1px 0; border-radius: 3px;
+    background: #313244; color: #f9e2af; font-size: 11px;
+  }
+  .roleCore { color: #a6e3a1; }
+  .roleCollab { color: #cba6f7; }
   .panel {
     position: absolute; background: rgba(30,30,46,.96); padding: 14px;
     border-radius: 8px; box-shadow: 0 4px 14px rgba(0,0,0,.4); z-index: 5;
   }
   #legendPanel { top: 16px; left: 16px; width: 250px; display: none; }
   #searchPanel  { top: 16px; right: 16px; width: 260px; display: none; }
+  #detailCard {
+    position: absolute; top: 16px; right: 16px; width: 340px; max-height: calc(100% - 32px);
+    overflow-y: auto; display: none; z-index: 8;
+    background: rgba(24,24,37,.98); padding: 16px; border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.5); border: 1px solid #45475a;
+  }
+  #detailCard h3 { margin: 0 0 4px; font-size: 16px; font-weight: 600; color: #cdd6f4; }
+  #detailCard .roleLine { font-size: 12px; color: #a6adc8; margin-bottom: 12px; }
+  #detailCard .field { margin-bottom: 10px; font-size: 12.5px; line-height: 1.55; }
+  #detailCard .field .k { color: #7f849c; font-size: 11px; margin-bottom: 2px; }
+  #detailCard .field .v { color: #cdd6f4; word-break: break-word; }
+  #detailCard .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+  #detailCard .closeX {
+    position: absolute; top: 10px; right: 12px; background: transparent; border: none;
+    color: #a6adc8; font-size: 18px; cursor: pointer; padding: 2px 8px; font-weight: 400;
+  }
+  #detailCard .closeX:hover { color: #cdd6f4; }
+  .copyBtn {
+    display: inline-block; margin-left: 6px; padding: 1px 6px; font-size: 10px;
+    background: #313244; border: 1px solid #45475a; border-radius: 3px; cursor: pointer; color: #a6adc8;
+  }
+  .copyBtn:hover { background: #45475a; color: #cdd6f4; }
   .panel h3 { margin: 0 0 9px; font-size: 13px; font-weight: 600; }
   #resetBtn {
     display: inline-block; margin-bottom: 9px; padding: 4px 11px; font-size: 12px;
@@ -335,6 +406,9 @@ PAGE = """<!DOCTYPE html>
   @keyframes spin { to { transform: rotate(360deg); } }
   #msg { font-size: 15px; margin-bottom: 8px; }
   #sub { font-size: 12.5px; color: #a6adc8; line-height: 1.65; }
+  #relaxBox { margin-top: 14px; display: none; text-align: left; }
+  #relaxBox h4 { margin: 0 0 8px; font-size: 13px; color: #cdd6f4; font-weight: 600; }
+  #relaxChips { display: flex; flex-wrap: wrap; gap: 6px; }
   .bar { width: 300px; height: 4px; background: #313244; border-radius: 2px; margin: 14px auto 0; overflow: hidden; }
   .bar div { height: 100%; background: #89b4fa; width: 0; transition: width .3s; }
   .bar.hidden { display: none; }
@@ -342,6 +416,7 @@ PAGE = """<!DOCTYPE html>
     position: absolute; bottom: 14px; left: 50%; transform: translateX(-50%);
     background: rgba(24,24,37,.94); padding: 7px 18px; border-radius: 18px;
     font-size: 12px; color: #a6adc8; z-index: 5; display: none; white-space: nowrap;
+    max-width: 92vw; overflow: hidden; text-overflow: ellipsis;
   }
 </style>
 </head>
@@ -359,20 +434,58 @@ PAGE = """<!DOCTYPE html>
         <option value="citations">按引用量</option>
       </select>
     </div>
-    <label class="opt deepOpt" title="先出快速结果，再用该方向 top 学者做滚雪球扩展，把散落的研究组连成网络。实测每位种子学者约需 14 秒（dblp 限速），10 位约 2~3 分钟，期间可以先看快速结果">
+    <label class="opt deepOpt" title="可选：先出快速结果，再用该方向 top 学者做滚雪球扩展。默认关闭。每位种子约 14 秒，10 位约 2~3 分钟。深度模式会混入非该方向的合作者，图上会标注「经关联引入的合作者」">
       <input type="checkbox" id="deepInput" /> 深度模式
     </label>
     <button id="goBtn">检索</button>
+    <div class="viewToggle" id="viewToggle">
+      <button type="button" id="viewGraphBtn" class="active">结构图</button>
+      <button type="button" id="viewListBtn">短名单</button>
+    </div>
   </div>
   <div id="presets"></div>
 </header>
 
 <main>
   <div id="graph"></div>
+  <div id="listView">
+    <div class="listDisclaimer">
+      短名单仅供学术结构探索与试用筛选。论文署名机构反映发表当时的署名单位，不等于现职担保。
+      Google Scholar 链接为作者搜索页（非精确主页）。引用/机构可能因 OpenAlex 配额或元数据缺口未补全。
+    </div>
+    <div class="listToolbar">
+      <div class="opt">姓名 <input id="listNameFilter" type="text" placeholder="关键字…" /></div>
+      <div class="opt">最少发文 <input id="listMinPapers" type="number" value="0" min="0" max="99" /></div>
+      <div class="opt">聚类
+        <select id="listClusterFilter"><option value="">全部</option></select>
+      </div>
+      <label class="chk"><input type="checkbox" id="listCoreOnly" /> 仅方向核心学者</label>
+      <label class="chk"><input type="checkbox" id="listHasInst" /> 仅有署名机构</label>
+      <button type="button" class="btnSecondary" id="exportCsvBtn">导出 CSV</button>
+      <span class="listMeta" id="listMeta"></span>
+    </div>
+    <div id="listTableWrap">
+      <table class="shortlist">
+        <thead>
+          <tr>
+            <th>姓名</th>
+            <th>论文署名机构（发表当时）</th>
+            <th>方向发文</th>
+            <th>方向相关引用</th>
+            <th>角色</th>
+            <th>团体/聚类</th>
+            <th>Scholar 搜索</th>
+            <th>数据缺口</th>
+          </tr>
+        </thead>
+        <tbody id="listBody"></tbody>
+      </table>
+    </div>
+  </div>
   <div class="panel" id="legendPanel">
     <div class="tabs">
       <div class="tab active" id="tabTeam">研究团体</div>
-      <div class="tab" id="tabInst">机构分布</div>
+      <div class="tab" id="tabInst">署名机构（历史）</div>
     </div>
     <div id="resetBtn">重置视图</div>
     <div id="legendList"></div>
@@ -383,8 +496,13 @@ PAGE = """<!DOCTYPE html>
     <input id="nodeSearch" placeholder="输入姓名..." autocomplete="off" />
     <div id="nodeResults"></div>
   </div>
+  <div id="detailCard">
+    <button type="button" class="closeX" id="detailClose" title="关闭">&times;</button>
+    <div id="detailBody"></div>
+  </div>
   <div id="stats"></div>
   <div id="deepBanner"></div>
+  <div id="degradeBanner"></div>
   <div id="overlay">
     <div class="box">
       <div class="spinner hidden" id="spinner"></div>
@@ -393,7 +511,12 @@ PAGE = """<!DOCTYPE html>
         数据来自 dblp 全网论文库，不限于任何预设名单。<br />
         关键词建议只用 1~2 个核心词 —— dblp 多个词之间是 AND 关系，词越多结果越少
         （"BEV" 有 4979 篇，"BEV perception autonomous driving" 只剩 19 篇）。<br />
-        dblp 要求每次请求间隔 4 秒，检索 300 篇约需 10 秒。
+        dblp 要求每次请求间隔 4 秒，检索 300 篇约需 10 秒。<br />
+        默认快速检索；深度模式为可选项（默认关闭），会引入非该方向的合作者。
+      </div>
+      <div id="relaxBox">
+        <h4>可点选放宽关键词后重搜</h4>
+        <div id="relaxChips"></div>
       </div>
       <div class="bar hidden" id="bar"><div id="barFill"></div></div>
     </div>
@@ -404,9 +527,39 @@ PAGE = """<!DOCTYPE html>
 var network = null, nodesDS = null, edgesDS = null;
 var colorById = {}, sizeById = {}, labelById = {}, allNodes = [];
 var modified = [], activeCid = null, currentES = null, deepStart = null;
+var activeInst = null, lastStats = null, currentView = 'graph', lastQuery = '';
 var DIM = '#3a3a4a';
 
 var $ = function (id) { return document.getElementById(id); };
+
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function roleLabel(n) {
+  return n.is_seed === false ? '经关联引入的合作者' : '方向核心';
+}
+
+function scholarSearchUrl(n) {
+  var q = '"' + n.label + '"' + (n.institution ? ' "' + n.institution + '"' : '');
+  return 'https://scholar.google.com/citations?view_op=search_authors&mauthors='
+    + encodeURIComponent(q);
+}
+
+function gapMarkers(n) {
+  var gaps = [];
+  if (!n.citations) gaps.push('缺引用');
+  if (!n.institution) gaps.push('缺署名机构');
+  if (n.is_seed === false) gaps.push('非方向发文引入');
+  return gaps;
+}
+
+function citationDisplay(n) {
+  // Missing enrichment must stay blank — do not show 0 as if it were a real count
+  return n.citations ? String(n.citations) : '';
+}
 
 fetch('/api/presets').then(function (r) { return r.json(); }).then(function (d) {
   var box = $('presets');
@@ -421,23 +574,72 @@ fetch('/api/presets').then(function (r) { return r.json(); }).then(function (d) 
 function setOverlay(show, opts) {
   opts = opts || {};
   $('overlay').classList.toggle('hidden', !show);
-  if (!show) return;
+  if (!show) { $('relaxBox').style.display = 'none'; return; }
   $('msg').textContent = opts.msg || '';
   $('sub').innerHTML = opts.sub || '';
   $('spinner').classList.toggle('hidden', !opts.busy);
   $('bar').classList.toggle('hidden', !opts.progress);
   if (opts.progress) $('barFill').style.width = opts.percent + '%';
+  if (opts.relaxQuery) showRelaxSuggestions(opts.relaxQuery, opts.message || opts.sub || '');
+  else if (!opts.busy) { /* keep existing relax if any */ }
+  else $('relaxBox').style.display = 'none';
+}
+
+function suggestQueries(q) {
+  var parts = q.trim().split(/\\s+/).filter(Boolean);
+  var out = [], seen = {};
+  function add(s, note) {
+    if (!s || s === q || seen[s]) return;
+    seen[s] = true;
+    out.push({ q: s, note: note });
+  }
+  if (parts.length >= 2) {
+    add(parts[0], '只保留首词');
+    add(parts.slice(0, -1).join(' '), '去掉末词');
+    if (parts.length >= 3) add(parts.slice(0, 2).join(' '), '只保留前两词');
+  }
+  return out;
+}
+
+function showRelaxSuggestions(q, msgText) {
+  var suggestions = suggestQueries(q);
+  var looksStrict = /AND|词越多|没有检索到|没有人在该方向|调低|调高|结果/.test(msgText || '')
+    || suggestions.length > 0;
+  if (!looksStrict || !suggestions.length) {
+    $('relaxBox').style.display = 'none';
+    return;
+  }
+  var box = $('relaxChips');
+  box.innerHTML = '';
+  suggestions.forEach(function (s) {
+    var c = document.createElement('span');
+    c.className = 'chip suggest';
+    c.textContent = s.q + '（' + s.note + '）';
+    c.title = '填入并重新检索';
+    c.onclick = function () {
+      $('topicInput').value = s.q;
+      runSearch();
+    };
+    box.appendChild(c);
+  });
+  $('relaxBox').style.display = 'block';
 }
 
 function runSearch() {
   var q = $('topicInput').value.trim();
   if (!q) { $('topicInput').focus(); return; }
   if (currentES) currentES.close();
+  lastQuery = q;
+  closeDetail();
+  setView('graph');
 
   $('goBtn').disabled = true;
   $('legendPanel').style.display = 'none';
   $('searchPanel').style.display = 'none';
   $('stats').style.display = 'none';
+  $('viewToggle').style.display = 'none';
+  $('degradeBanner').style.display = 'none';
+  $('listView').classList.remove('visible');
   setOverlay(true, { busy: true, msg: '正在检索「' + q + '」...',
                      sub: '正在联网查询 dblp 论文库', progress: true, percent: 0 });
 
@@ -460,7 +662,6 @@ function runSearch() {
   es.addEventListener('done', function (e) {
     render(JSON.parse(e.data));
     if (deep) {
-      // 深度模式下先让用户看到快速结果，滚雪球在后台继续，完成后再替换整张图
       deepStart = Date.now();
       $('deepBanner').style.display = 'block';
       $('deepBanner').textContent = '深度模式：正在扩展合作网络，完成后自动更新（可先浏览当前结果）';
@@ -471,7 +672,6 @@ function runSearch() {
 
   es.addEventListener('deep_progress', function (e) {
     var d = JSON.parse(e.data);
-    // 用已完成种子的实际耗时推算剩余时间，比写死一个估计值可靠
     var extra = '';
     if (deepStart && d.done > 0 && d.total > d.done) {
       var perSeed = (Date.now() - deepStart) / d.done;
@@ -501,11 +701,10 @@ function runSearch() {
     es.close(); currentES = null; $('goBtn').disabled = false;
     var m = '检索失败';
     try { m = JSON.parse(e.data).message; } catch (err) {}
-    setOverlay(true, { busy: false, msg: '没有结果', sub: m });
+    setOverlay(true, { busy: false, msg: '没有结果', sub: esc(m),
+                       relaxQuery: q, message: m });
   });
 
-  // EventSource 自身的连接错误（服务没起来 / 断网）走 onerror，
-  // 和上面服务端主动推的 error 事件是两回事，要分开处理。
   es.onerror = function () {
     if (currentES !== es) return;
     es.close(); currentES = null; $('goBtn').disabled = false;
@@ -515,17 +714,15 @@ function runSearch() {
 }
 
 function render(data) {
-  // 没有 vis 就直接说清楚，别让页面静默停在一片空白上
   if (typeof vis === 'undefined' || !vis.Network) {
     setOverlay(true, { busy: false, msg: '图形库未能加载',
       sub: 'vis-network 没加载成功，图无法绘制。<br>请确认 app.py 与 lib/ 目录在同一个文件夹下，然后刷新页面。' });
     return;
   }
   allNodes = data.nodes;
+  lastStats = data.stats || {};
   colorById = {}; sizeById = {}; labelById = {};
   allNodes.forEach(function (n) {
-    // 记住每个节点本来的颜色：节点按团体上色，高亮/筛选之后必须各自还原，
-    // 不能统一刷成同一个值。大小由 computeSizes() 按当前口径算。
     colorById[n.id] = n.color;
     labelById[n.id] = (n.label || '').toLowerCase();
   });
@@ -535,19 +732,19 @@ function render(data) {
     var samples = (n.samples || []).slice(0, 3).map(function (s) {
       return '· ' + s.year + ' ' + (s.title || '').substring(0, 60);
     }).join('<br>');
-    // 深度模式里 is_seed=false 的是滚雪球带进来的合作者，他们不一定做这个方向，
-    // 提示里要说清楚，不能让人误以为是该方向的核心学者
     var head = n.is_seed === false
-      ? '<b>' + n.label + '</b><br><i>合作者（经该方向学者关联引入）</i>'
-      : '<b>' + n.label + '</b><br>该方向发文: ' + n.papers + ' 篇';
+      ? '<b>' + n.label + '</b><br><i>经关联引入的合作者（不一定做该方向）</i>'
+      : '<b>' + n.label + '</b><br>方向核心 · 该方向发文: ' + n.papers + ' 篇';
     var extra = '';
-    if (n.citations) extra += '<br>该方向被引: ' + n.citations + ' 次';
-    if (n.institution) extra += '<br>机构: ' + n.institution;
+    if (n.citations) extra += '<br>该方向相关引用: ' + n.citations + ' 次';
+    else extra += '<br>该方向相关引用: 未补全';
+    if (n.institution) extra += '<br>论文署名机构（发表当时）: ' + n.institution;
+    else extra += '<br>论文署名机构: 未获取';
     if (n.topics && n.topics.length) extra += '<br>主题: ' + n.topics.join('、');
     return {
       id: n.id, label: n.label, color: n.color, size: sizeById[n.id], community: n.community,
       title: head + extra + '<br>dblp: ' + n.id + (samples ? '<br><br>代表作:<br>' + samples : '')
-        + '<br><br><i>点击跳转 Google Scholar</i>'
+        + '<br><br><i>点击打开详情卡</i>'
     };
   }));
   edgesDS = new vis.DataSet(data.edges.map(function (e) {
@@ -559,10 +756,6 @@ function render(data) {
   network = new vis.Network($('graph'), { nodes: nodesDS, edges: edgesDS }, {
     nodes: { shape: 'dot', font: { color: '#cdd6f4', size: 13 } },
     edges: { smooth: false, scaling: { min: 1, max: 6 } },
-    // 一个方向的检索结果往往包含很多互不相连的小研究组（彼此没有共同作者）。
-    // 独立组之间只有斥力、没有弹簧拉力，斥力一大就会把它们推到很远，
-    // 整张图缩放后节点只剩几个像素、什么都看不清。所以这里把斥力压到 vis 默认量级，
-    // 同时把向心力调高，让这些散落的小组聚拢到画面中央。
     physics: {
       stabilization: { iterations: 200 },
       barnesHut: { gravitationalConstant: -3000, centralGravity: 0.75,
@@ -571,28 +764,24 @@ function render(data) {
     interaction: { hover: true, tooltipDelay: 120 }
   });
 
-  // dblp 不提供作者的 Google Scholar 主页链接，也没有可靠的第三方 API 能把姓名
-  // 精确映射到某个 Scholar profile（同名学者很常见）。所以不去猜一个具体链接，
-  // 而是跳转到 Google Scholar 的"作者搜索"结果页，让用户自己从候选里选——
-  // 带上机构信息（如果有）帮助缩小范围，但不保证第一个结果就是本人。
+  // Click opens detail card (Scholar is a button inside the card, not a direct jump)
   network.on('click', function (params) {
-    if (!params.nodes.length) return;
-    var n = allNodes.find(function (x) { return x.id === params.nodes[0]; });
-    if (!n) return;
-    var q = '"' + n.label + '"' + (n.institution ? ' "' + n.institution + '"' : '');
-    window.open('https://scholar.google.com/citations?view_op=search_authors&mauthors='
-      + encodeURIComponent(q), '_blank', 'noopener');
+    if (!params.nodes.length) { closeDetail(); return; }
+    openDetail(params.nodes[0]);
   });
 
   modified = []; activeCid = null; activeInst = null;
   buildLegend(data.legend);
   buildInstitutions();
+  refreshListClusterOptions();
+  renderShortlist();
   $('nodeSearch').value = '';
   $('nodeResults').innerHTML = '';
-  $('legendPanel').style.display = 'block';
-  $('searchPanel').style.display = 'block';
+  $('legendPanel').style.display = currentView === 'graph' ? 'block' : 'none';
+  $('searchPanel').style.display = currentView === 'graph' ? 'block' : 'none';
+  $('viewToggle').style.display = 'flex';
 
-  var s = data.stats;
+  var s = data.stats || {};
   var txt;
   if (s.mode === 'deep') {
     txt = '深度模式 · 检索 ' + s.papers_fetched + ' / ' + s.papers_available + ' 篇论文 · '
@@ -600,21 +789,34 @@ function render(data) {
         + s.relations + ' 条 · 独立网络 ' + s.components + ' 个 · 研究团体 ' + s.communities + ' 个';
   } else {
     txt = '检索 ' + s.papers_fetched + ' / ' + s.papers_available
-        + ' 篇论文 · 核心学者 ' + s.scholars + ' 位（该方向发文 ≥ ' + s.min_papers + ' 篇）· 合作关系 '
+        + ' 篇论文 · 方向核心 ' + s.scholars + ' 位（该方向发文 ≥ ' + s.min_papers + ' 篇）· 合作关系 '
         + s.relations + ' 条 · 独立网络 ' + s.components + ' 个 · 研究团体 ' + s.communities + ' 个';
   }
   if (s.enriched) {
-    txt += ' · 引用数 ' + s.with_citations + ' 人 / 机构 ' + s.with_institution + ' 人';
+    txt += ' · 引用数 ' + s.with_citations + ' 人 / 署名机构 ' + s.with_institution + ' 人';
+  }
+  if (s.degraded || s.enrich_status === 'degraded' || s.enrich_status === 'partial') {
+    txt += ' · 补充已降级';
+    $('degradeBanner').style.display = 'block';
+    $('degradeBanner').textContent = s.enrich_message
+      || '引用/机构补充已降级：配额用尽或接口失败（主图仍可用，详情与短名单会标缺口）';
+  } else {
+    $('degradeBanner').style.display = 'none';
   }
   $('stats').textContent = txt;
   $('stats').style.display = 'block';
 
-  // 布局稳定后必须 fit 一次，否则初始视口是按空图定的，节点会跑到画面外
+  // Few-result hint: still show the graph, but offer relaxation chips on overlay briefly? 
+  // Keep graph; if scholars are very few, surface suggestions under stats via overlay only on error.
+  // Soft hint when papers_available is tiny relative to query wordiness:
+  if (lastQuery && suggestQueries(lastQuery).length && s.papers_available != null && s.papers_available < 30) {
+    // non-blocking: user already has a graph; skip overlay
+  }
+
   network.once('stabilizationIterationsDone', function () {
     network.fit({ animation: false });
     setOverlay(false);
   });
-  // 兜底：万一 stabilization 事件没如期触发，也不能让遮罩一直盖着
   setTimeout(function () {
     if (network) network.fit({ animation: false });
     setOverlay(false);
@@ -622,8 +824,6 @@ function render(data) {
 }
 
 function computeSizes() {
-  // 两种口径分别归一化：按发文量看谁在这个方向产出多，按引用量看谁影响力大。
-  // 引用数缺失的（OpenAlex 没匹配到）统一给最小尺寸，不能当成 0 影响力去参与归一化。
   var mode = $('sizeMode').value;
   var maxP = 1, maxC = 1;
   allNodes.forEach(function (n) {
@@ -666,12 +866,12 @@ function highlight(id) {
   nodesDS.update(ups);
   modified = [id].concat(nb);
   network.focus(id, { scale: 1.15, animation: { duration: 500, easingFunction: 'easeInOutQuad' } });
+  openDetail(id);
 }
 
 function filterCommunity(cid) {
   restore();
   if (activeCid === cid) { activeCid = null; setActive(null); return; }
-  // 一次性算好全部节点的目标样式再单批提交，避免上千节点逐个 update 造成卡顿
   nodesDS.update(allNodes.map(function (n) {
     var inC = n.community === cid;
     return { id: n.id, color: inC ? colorById[n.id] : DIM, size: inC ? sizeById[n.id] : 8 };
@@ -711,7 +911,7 @@ function buildInstitutions() {
   var ranked = Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a]; });
   box.innerHTML = '';
   if (!ranked.length) {
-    box.innerHTML = '<div class="empty">这批结果没有拿到机构信息</div>';
+    box.innerHTML = '<div class="empty">这批结果没有拿到论文署名机构（发表当时）</div>';
     return;
   }
   var missing = allNodes.filter(function (n) { return !n.institution; }).length;
@@ -721,7 +921,7 @@ function buildInstitutions() {
     it.className = 'instItem';
     it.setAttribute('data-inst', name);
     var l = document.createElement('div');
-    l.className = 'lbl'; l.textContent = name; l.title = name;
+    l.className = 'lbl'; l.textContent = name; l.title = name + '（论文署名机构，发表当时）';
     var c = document.createElement('div');
     c.className = 'cnt'; c.textContent = counts[name];
     it.appendChild(l); it.appendChild(c);
@@ -731,14 +931,12 @@ function buildInstitutions() {
   if (missing) {
     var note = document.createElement('div');
     note.className = 'empty';
-    // 覆盖率要如实说明，不能让人以为没列出的机构就是不存在
-    note.textContent = '另有 ' + missing + ' 位未获取到机构（OpenAlex 缺少该论文的机构元数据）';
+    note.textContent = '另有 ' + missing + ' 位未获取到论文署名机构（发表当时；OpenAlex 缺元数据或补充降级）';
     frag.appendChild(note);
   }
   box.appendChild(frag);
 }
 
-var activeInst = null;
 function filterInstitution(name) {
   restore();
   if (activeInst === name) { activeInst = null; setActiveInst(null); return; }
@@ -756,6 +954,261 @@ function setActiveInst(name) {
   });
 }
 
+function copyText(text, btn) {
+  if (!text) return;
+  function ok() {
+    if (!btn) return;
+    var old = btn.textContent;
+    btn.textContent = '已复制';
+    setTimeout(function () { btn.textContent = old; }, 1200);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(ok).catch(function () {
+      fallbackCopy(text); ok();
+    });
+  } else {
+    fallbackCopy(text); ok();
+  }
+}
+
+function fallbackCopy(text) {
+  var ta = document.createElement('textarea');
+  ta.value = text; document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+}
+
+function openDetail(id) {
+  var n = allNodes.find(function (x) { return x.id === id; });
+  if (!n) return;
+  var gaps = gapMarkers(n);
+  var scholarUrl = scholarSearchUrl(n);
+  var samples = (n.samples || []).slice(0, 5);
+  var html = '';
+  html += '<h3>' + esc(n.label) + '</h3>';
+  html += '<div class="roleLine">' + (n.is_seed === false
+    ? '<span class="roleCollab">经关联引入的合作者</span>（不一定做该方向）'
+    : '<span class="roleCore">方向核心</span>') + '</div>';
+
+  function field(k, v, copyVal) {
+    var row = '<div class="field"><div class="k">' + esc(k) + '</div><div class="v">' + v;
+    if (copyVal) {
+      row += ' <button type="button" class="copyBtn" data-copy="' + esc(copyVal) + '">复制</button>';
+    }
+    row += '</div></div>';
+    return row;
+  }
+
+  html += field('角色', esc(roleLabel(n)), roleLabel(n));
+  if (n.is_seed !== false) {
+    html += field('该方向发文', esc(n.papers) + ' 篇', String(n.papers));
+  } else {
+    html += field('该方向发文', '—（经关联引入，非该方向检索命中）', '');
+  }
+  html += field('该方向相关引用',
+    n.citations ? (esc(n.citations) + ' 次') : '<span style="color:#f9e2af">未补全 / 缺引用</span>',
+    n.citations ? String(n.citations) : '');
+  html += field('论文署名机构（发表当时）',
+    n.institution ? esc(n.institution) : '<span style="color:#f9e2af">未获取（≠无单位）</span>',
+    n.institution || '');
+  html += field('研究主题',
+    (n.topics && n.topics.length) ? esc(n.topics.join('、')) : '—',
+    (n.topics && n.topics.length) ? n.topics.join(', ') : '');
+  if (samples.length) {
+    html += '<div class="field"><div class="k">代表作（该方向样本）</div><div class="v">'
+      + samples.map(function (s) {
+          return '· ' + esc(s.year) + ' ' + esc((s.title || '').substring(0, 80));
+        }).join('<br>') + '</div></div>';
+  }
+  html += field('dblp id', esc(n.id), n.id);
+  html += field('团体/聚类 ID', esc(n.community), String(n.community));
+  html += field('数据置信度 / 缺口',
+    gaps.length
+      ? gaps.map(function (g) { return '<span class="gapTag">' + esc(g) + '</span>'; }).join('')
+      : '<span style="color:#a6e3a1">引用与署名机构均已补全</span>',
+    gaps.join(', '));
+  if (lastStats && (lastStats.degraded || lastStats.enrich_status === 'degraded' || lastStats.enrich_status === 'partial')) {
+    html += '<div class="field"><div class="k">全局补充状态</div><div class="v" style="color:#f9e2af">'
+      + esc(lastStats.enrich_message || '引用/机构补充已降级') + '</div></div>';
+  }
+  html += field('Google Scholar',
+    '<span style="color:#a6adc8;font-size:11px">作者搜索页（非精确主页；同名需人工甄别）</span><br>'
+    + '<a href="' + esc(scholarUrl) + '" target="_blank" rel="noopener" style="color:#89b4fa;word-break:break-all;font-size:11px">'
+    + esc(scholarUrl) + '</a>',
+    scholarUrl);
+
+  html += '<div class="actions">'
+    + '<button type="button" class="btnSecondary" id="detailScholarBtn">打开 Scholar 搜索</button>'
+    + '<button type="button" class="btnSecondary" id="detailCopyName">复制姓名</button>'
+    + '<button type="button" class="btnSecondary" id="detailCopyAll">复制摘要字段</button>'
+    + '</div>';
+
+  $('detailBody').innerHTML = html;
+  $('detailCard').style.display = 'block';
+  // Hide the search panel while detail is open to avoid overlap on the right
+  $('searchPanel').style.display = 'none';
+
+  Array.prototype.forEach.call($('detailBody').querySelectorAll('.copyBtn'), function (btn) {
+    btn.onclick = function (e) {
+      e.stopPropagation();
+      copyText(btn.getAttribute('data-copy'), btn);
+    };
+  });
+  $('detailScholarBtn').onclick = function () {
+    window.open(scholarUrl, '_blank', 'noopener');
+  };
+  $('detailCopyName').onclick = function () { copyText(n.label, $('detailCopyName')); };
+  $('detailCopyAll').onclick = function () {
+    var lines = [
+      '姓名: ' + n.label,
+      '角色: ' + roleLabel(n),
+      '该方向发文: ' + (n.is_seed === false ? '' : n.papers),
+      '该方向相关引用: ' + citationDisplay(n),
+      '论文署名机构（发表当时）: ' + (n.institution || ''),
+      '主题: ' + ((n.topics && n.topics.length) ? n.topics.join(', ') : ''),
+      'dblp id: ' + n.id,
+      '团体/聚类 ID: ' + n.community,
+      '缺口: ' + gaps.join(', '),
+      'Scholar 搜索: ' + scholarUrl
+    ];
+    copyText(lines.join('\\n'), $('detailCopyAll'));
+  };
+}
+
+function closeDetail() {
+  $('detailCard').style.display = 'none';
+  if (currentView === 'graph' && allNodes.length) {
+    $('searchPanel').style.display = 'block';
+  }
+}
+
+function setView(view) {
+  currentView = view;
+  $('viewGraphBtn').classList.toggle('active', view === 'graph');
+  $('viewListBtn').classList.toggle('active', view === 'list');
+  if (view === 'list') {
+    $('listView').classList.add('visible');
+    $('legendPanel').style.display = 'none';
+    $('searchPanel').style.display = 'none';
+    closeDetail();
+    renderShortlist();
+  } else {
+    $('listView').classList.remove('visible');
+    if (allNodes.length) {
+      $('legendPanel').style.display = 'block';
+      $('searchPanel').style.display = 'block';
+      if (network) network.fit({ animation: false });
+    }
+  }
+}
+
+function filteredNodes() {
+  var nameQ = ($('listNameFilter').value || '').trim().toLowerCase();
+  var minP = parseInt($('listMinPapers').value, 10); if (isNaN(minP) || minP < 0) minP = 0;
+  var cluster = $('listClusterFilter').value;
+  var coreOnly = $('listCoreOnly').checked;
+  var hasInst = $('listHasInst').checked;
+  return allNodes.filter(function (n) {
+    if (nameQ && labelById[n.id].indexOf(nameQ) === -1) return false;
+    if (n.papers < minP) return false;
+    if (cluster !== '' && String(n.community) !== cluster) return false;
+    if (coreOnly && n.is_seed === false) return false;
+    if (hasInst && !n.institution) return false;
+    return true;
+  });
+}
+
+function refreshListClusterOptions() {
+  var sel = $('listClusterFilter');
+  var cur = sel.value;
+  var ids = {};
+  allNodes.forEach(function (n) { ids[n.community] = true; });
+  var keys = Object.keys(ids).map(Number).sort(function (a, b) { return a - b; });
+  sel.innerHTML = '<option value="">全部</option>';
+  keys.forEach(function (cid) {
+    var o = document.createElement('option');
+    o.value = String(cid);
+    o.textContent = '聚类 ' + cid;
+    sel.appendChild(o);
+  });
+  if (cur && ids[Number(cur)] !== undefined) sel.value = cur;
+}
+
+function renderShortlist() {
+  var rows = filteredNodes().slice().sort(function (a, b) {
+    if (b.papers !== a.papers) return b.papers - a.papers;
+    return (b.citations || 0) - (a.citations || 0);
+  });
+  $('listMeta').textContent = '显示 ' + rows.length + ' / ' + allNodes.length + ' 人';
+  var body = $('listBody');
+  body.innerHTML = '';
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="8" class="empty">没有符合筛选条件的学者</td></tr>';
+    return;
+  }
+  var frag = document.createDocumentFragment();
+  rows.forEach(function (n) {
+    var tr = document.createElement('tr');
+    var gaps = gapMarkers(n);
+    var url = scholarSearchUrl(n);
+    tr.innerHTML =
+      '<td>' + esc(n.label) + '</td>'
+      + '<td>' + esc(n.institution || '') + '</td>'
+      + '<td>' + (n.is_seed === false ? '' : esc(n.papers)) + '</td>'
+      + '<td>' + esc(citationDisplay(n)) + '</td>'
+      + '<td class="' + (n.is_seed === false ? 'roleCollab' : 'roleCore') + '">' + esc(roleLabel(n)) + '</td>'
+      + '<td>' + esc(n.community) + '</td>'
+      + '<td><a href="' + esc(url) + '" target="_blank" rel="noopener">搜索页</a></td>'
+      + '<td>' + (gaps.length
+          ? gaps.map(function (g) { return '<span class="gapTag">' + esc(g) + '</span>'; }).join('')
+          : '') + '</td>';
+    frag.appendChild(tr);
+  });
+  body.appendChild(frag);
+}
+
+function exportCsv() {
+  var rows = filteredNodes().slice().sort(function (a, b) {
+    if (b.papers !== a.papers) return b.papers - a.papers;
+    return (b.citations || 0) - (a.citations || 0);
+  });
+  var disclaimer = [
+    '# 免责声明：本短名单仅供学术结构探索与试用筛选。',
+    '# 论文署名机构（发表当时）反映论文元数据中的署名单位，不等于现职担保。',
+    '# Google Scholar 列为作者搜索页 URL，非精确个人主页；同名需人工甄别。',
+    '# 方向相关引用/机构可能因 OpenAlex 配额用尽、接口失败或元数据缺口而缺失（留空，勿当作 0）。',
+    '# 查询词: ' + (lastQuery || ''),
+    '# 导出时间(本地): ' + new Date().toLocaleString()
+  ];
+  var header = ['姓名', '论文署名机构（发表当时）', '方向发文数', '方向相关引用',
+                '角色标签', '团体/聚类ID', 'Scholar搜索URL', '数据置信/缺口标记'];
+  function csvCell(v) {
+    var s = String(v == null ? '' : v);
+    if (/[",\\n\\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+    return s;
+  }
+  var lines = disclaimer.concat([header.map(csvCell).join(',')]);
+  rows.forEach(function (n) {
+    lines.push([
+      n.label,
+      n.institution || '',
+      n.is_seed === false ? '' : n.papers,
+      citationDisplay(n),
+      roleLabel(n),
+      n.community,
+      scholarSearchUrl(n),
+      gapMarkers(n).join('; ')
+    ].map(csvCell).join(','));
+  });
+  // UTF-8 BOM so Excel on Windows opens Chinese correctly
+  var blob = new Blob(['\\ufeff' + lines.join('\\n')], { type: 'text/csv;charset=utf-8' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'talent-shortlist-' + (lastQuery || 'export').replace(/ +/g, '_') + '.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+}
+
 $('tabTeam').onclick = function () {
   $('tabTeam').classList.add('active'); $('tabInst').classList.remove('active');
   $('legendList').style.display = 'block'; $('instList').style.display = 'none';
@@ -765,12 +1218,20 @@ $('tabInst').onclick = function () {
   $('instList').style.display = 'block'; $('legendList').style.display = 'none';
 };
 $('sizeMode').onchange = applySizeMode;
-
 $('resetBtn').onclick = function () {
   restore(); activeCid = null; activeInst = null; setActive(null); setActiveInst(null);
 };
 $('goBtn').onclick = runSearch;
 $('topicInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') runSearch(); });
+$('detailClose').onclick = closeDetail;
+$('viewGraphBtn').onclick = function () { setView('graph'); };
+$('viewListBtn').onclick = function () { setView('list'); };
+$('listNameFilter').addEventListener('input', function () { renderShortlist(); });
+$('listMinPapers').addEventListener('input', function () { renderShortlist(); });
+$('listClusterFilter').onchange = function () { renderShortlist(); };
+$('listCoreOnly').onchange = function () { renderShortlist(); };
+$('listHasInst').onchange = function () { renderShortlist(); };
+$('exportCsvBtn').onclick = exportCsv;
 
 var nsTimer;
 $('nodeSearch').addEventListener('input', function (e) {
@@ -786,7 +1247,10 @@ $('nodeSearch').addEventListener('input', function (e) {
     hits.slice(0, 30).forEach(function (n) {
       var d = document.createElement('div');
       d.className = 'hit';
-      d.innerHTML = '<div class="n">' + n.label + '</div><div class="m">该方向 ' + n.papers + ' 篇</div>';
+      var meta = n.is_seed === false
+        ? '经关联引入的合作者'
+        : ('方向核心 · 该方向 ' + n.papers + ' 篇');
+      d.innerHTML = '<div class="n">' + esc(n.label) + '</div><div class="m">' + esc(meta) + '</div>';
       d.onclick = function () { highlight(n.id); box.innerHTML = ''; e.target.value = n.label; };
       frag.appendChild(d);
     });
