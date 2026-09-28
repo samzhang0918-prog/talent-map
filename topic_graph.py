@@ -17,6 +17,8 @@
 """
 
 import colorsys
+import hashlib
+import json
 import os
 import re
 import threading
@@ -24,6 +26,7 @@ import time
 import unicodedata
 import urllib.parse
 from collections import Counter, defaultdict
+from urllib.parse import urlparse
 
 import networkx as nx
 import requests
@@ -32,7 +35,7 @@ from networkx.algorithms.community import louvain_communities
 DBLP_API = "https://dblp.org/search/publ/api"
 PAGE_SIZE = 100          # dblp 单页上限
 MAX_OFFSET = 10000       # dblp 分页硬上限，超过返回空
-CRAWL_DELAY = 4.5        # dblp robots.txt 要求 Crawl-delay: 4，留点余量
+CRAWL_DELAY = 4.5        # dblp robots.txt 曾要求 Crawl-delay: 4，留点余量
 # 滚雪球阶段每个种子一次请求，比翻页更容易触发限流：实测 4.5 秒时 20 个种子有一半拿到
 # 500 失败，放宽到 6 秒后 8/8 全部成功，所以这里单独用更保守的间隔。
 SNOWBALL_DELAY = 6.0
@@ -53,18 +56,22 @@ PRESET_TOPICS = [
 
 SESSION = requests.Session()
 _UA_CONTACT = os.environ.get("CONTACT_URL", "").strip()
+_UA = (
+    f"talent-map/1.0 (+{_UA_CONTACT}) "
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+) if _UA_CONTACT else (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 SESSION.headers.update({
     # 挂到公网长期跑之后，请求量不再是"自用脚本"那种偶发流量，向 dblp/OpenAlex
     # 表明身份和联系方式是对公开 API 的基本礼貌，出问题时对方也能找到人而不是直接封 IP。
     # 没配置 CONTACT_URL 时退化成普通浏览器 UA，本地自用不受影响。
-    "User-Agent": (
-        f"talent-map/1.0 (+{_UA_CONTACT}) "
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ) if _UA_CONTACT else (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
+    "User-Agent": _UA,
+    # 明确要 JSON；Anubis 挑战页仍可能以 text/html 返回，下面会识别并完成 PoW。
+    "Accept": "application/json, text/javascript;q=0.9, */*;q=0.1",
+    "Accept-Language": "en-US,en;q=0.9",
 })
 
 # Web 应用给每个搜索请求单独开一个线程（见 app.py 的 worker），如果限速只在各自
@@ -75,16 +82,161 @@ SESSION.headers.update({
 _DBLP_GATE = threading.Lock()
 _DBLP_LAST = 0.0
 
+# 成功 JSON 页缓存：同样的 q/offset 在短时间内重复搜索时不必再打 dblp。
+_DBLP_RESP_CACHE = {}
+_DBLP_RESP_CACHE_TTL = 20 * 60
+_DBLP_RESP_CACHE_LOCK = threading.Lock()
+_DBLP_RESP_CACHE_MAX = 64
+
+# Anubis（Techaro）保护：dblp 对疑似自动化流量返回 PoW 挑战页，浏览器解完后
+# 拿 auth cookie。这是站点正常的 soft challenge，用同样的 HTTP 客户端完成即可。
+_ANUBIS_CHALLENGE_RE = re.compile(
+    r'<script id="anubis_challenge" type="application/json">(.*?)</script>',
+    re.DOTALL,
+)
+_ANUBIS_AUTHED = False
+
+
+def _dblp_cache_get(url):
+    now = time.time()
+    with _DBLP_RESP_CACHE_LOCK:
+        hit = _DBLP_RESP_CACHE.get(url)
+        if not hit:
+            return None
+        ts, payload = hit
+        if now - ts > _DBLP_RESP_CACHE_TTL:
+            del _DBLP_RESP_CACHE[url]
+            return None
+        return payload
+
+
+def _dblp_cache_put(url, payload):
+    with _DBLP_RESP_CACHE_LOCK:
+        if len(_DBLP_RESP_CACHE) >= _DBLP_RESP_CACHE_MAX:
+            # 丢掉最旧的一条
+            oldest = min(_DBLP_RESP_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            del _DBLP_RESP_CACHE[oldest]
+        _DBLP_RESP_CACHE[url] = (time.time(), payload)
+
+
+def _anubis_meets(digest: bytes, difficulty: int) -> bool:
+    """与 Anubis sha256-purejs worker 相同的难度判定。"""
+    prefix = difficulty // 2
+    odd = difficulty % 2 != 0
+    for i in range(prefix):
+        if digest[i] != 0:
+            return False
+    if odd and (digest[prefix] >> 4) != 0:
+        return False
+    return True
+
+
+def _solve_anubis_pow(random_data: str, difficulty: int, timeout_s: float = 60.0):
+    """暴力找 nonce，使 sha256(randomData + nonce) 满足 difficulty。返回 (hash_hex, nonce)。"""
+    deadline = time.monotonic() + timeout_s
+    nonce = 0
+    data_prefix = random_data  # str concat, matching JS `data + nonce`
+    while time.monotonic() < deadline:
+        digest = hashlib.sha256(f"{data_prefix}{nonce}".encode("utf-8")).digest()
+        if _anubis_meets(digest, difficulty):
+            return digest.hex(), nonce
+        nonce += 1
+    raise TimeoutError(f"Anubis PoW timed out after {timeout_s}s (difficulty={difficulty})")
+
+
+def _is_anubis_challenge(resp) -> bool:
+    if resp is None:
+        return False
+    text_head = resp.text[:4000] if resp.text else ""
+    if "anubis_challenge" in text_head or "Making sure you're not a bot" in text_head:
+        return True
+    ct = (resp.headers.get("content-type") or "").lower()
+    # 要 JSON 却拿到 HTML，多半是挑战页或其他拦截
+    if "html" in ct and "json" not in ct:
+        return "anubis" in text_head.lower() or "within.website" in text_head
+    return False
+
+
+def _pass_anubis_challenge(resp, original_url) -> bool:
+    """解析挑战、算 PoW、打 pass-challenge，把 auth cookie 写入 SESSION。"""
+    global _ANUBIS_AUTHED
+    m = _ANUBIS_CHALLENGE_RE.search(resp.text or "")
+    if not m:
+        print("[dblp] Anubis HTML without challenge JSON", flush=True)
+        return False
+    try:
+        payload = json.loads(m.group(1))
+        challenge = payload["challenge"]
+        rules = payload.get("rules") or {}
+        random_data = challenge["randomData"]
+        difficulty = int(rules.get("difficulty") or challenge.get("difficulty") or 5)
+        cid = challenge["id"]
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[dblp] Anubis challenge parse failed: {exc}", flush=True)
+        return False
+
+    t0 = time.monotonic()
+    try:
+        hash_hex, nonce = _solve_anubis_pow(random_data, difficulty)
+    except TimeoutError as exc:
+        print(f"[dblp] {exc}", flush=True)
+        return False
+    elapsed_ms = max(1, int((time.monotonic() - t0) * 1000))
+    print(f"[dblp] Anubis PoW solved difficulty={difficulty} nonce={nonce} "
+          f"in {elapsed_ms}ms", flush=True)
+
+    parsed = urlparse(original_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    pass_url = f"{origin}/.within.website/x/cmd/anubis/api/pass-challenge"
+    try:
+        # 不跟随重定向：只要 Set-Cookie；跟着走有时会踩到 dblp 间歇 500。
+        pass_resp = SESSION.get(
+            pass_url,
+            params={
+                "id": cid,
+                "response": hash_hex,
+                "nonce": str(nonce),
+                "redir": "/",
+                "elapsedTime": str(elapsed_ms),
+            },
+            timeout=30,
+            allow_redirects=False,
+        )
+    except requests.RequestException as exc:
+        print(f"[dblp] Anubis pass-challenge failed: {exc}", flush=True)
+        return False
+
+    authed = any(k.startswith("dblp_org-auth") for k in SESSION.cookies.keys())
+    if not authed:
+        # 少数情况下 cookie 名不同，再看响应是否带 Location
+        print(f"[dblp] Anubis pass status={pass_resp.status_code} "
+              f"cookies={list(SESSION.cookies.keys())}", flush=True)
+    _ANUBIS_AUTHED = authed or pass_resp.status_code in (200, 302, 303, 307, 308)
+    return _ANUBIS_AUTHED
+
 
 def dblp_get(url, min_gap, timeout=30):
-    """按全局节奏发一个 dblp 请求。并发调用会自动排队，不会叠加请求频率。"""
+    """按全局节奏发一个 dblp 请求；遇 Anubis 挑战则完成 PoW 后重试一次。"""
     global _DBLP_LAST
     with _DBLP_GATE:
         wait = min_gap - (time.monotonic() - _DBLP_LAST)
         if wait > 0:
             time.sleep(wait)
         try:
-            return SESSION.get(url, timeout=timeout)
+            resp = SESSION.get(url, timeout=timeout)
+            if _is_anubis_challenge(resp):
+                print("[dblp] Anubis challenge detected, solving PoW…", flush=True)
+                if _pass_anubis_challenge(resp, url):
+                    # 挑战刚通过后 dblp 偶发对紧接的业务请求回 500，稍等再取一次。
+                    time.sleep(0.6)
+                    resp = SESSION.get(url, timeout=timeout)
+                    if resp.status_code >= 500:
+                        time.sleep(1.2)
+                        resp = SESSION.get(url, timeout=timeout)
+                    if _is_anubis_challenge(resp):
+                        print("[dblp] Still challenged after PoW; cookie may be rejected",
+                              flush=True)
+            return resp
         finally:
             # 以请求"结束"时刻计时，宁可比 Crawl-delay 更保守
             _DBLP_LAST = time.monotonic()
@@ -96,20 +248,32 @@ def fetch_page(query, offset, max_retries=5):
 
     dblp 的 500 是间歇性的（实测同一 offset 第一次 500、重试就 200），
     所以这里退避重试，并把"失败"和"没数据"区分开交给调用方判断。
+    另外：2025 起 dblp 前置了 Anubis PoW，HTTP 200 + HTML 挑战页不能当成功。
     """
     url = f"{DBLP_API}?q={urllib.parse.quote_plus(query)}&format=json&h={PAGE_SIZE}&f={offset}"
+    cached = _dblp_cache_get(url)
+    if cached is not None:
+        return cached
+
     for attempt in range(max_retries):
         try:
             resp = dblp_get(url, CRAWL_DELAY)
-            if resp.status_code == 200:
+            if _is_anubis_challenge(resp):
+                print(f"[dblp] 第 {attempt+1}/{max_retries} 次仍是 Anubis HTML", flush=True)
+                time.sleep(CRAWL_DELAY * (attempt + 1))
+                continue
+            ct = (resp.headers.get("content-type") or "").lower()
+            if resp.status_code == 200 and "json" in ct:
                 hits = resp.json()["result"]["hits"]
-                return hits.get("hit", []), int(hits.get("@total", 0))
+                payload = (hits.get("hit", []) or [], int(hits.get("@total", 0)))
+                _dblp_cache_put(url, payload)
+                return payload
             # 临时诊断日志：定位公开部署后 dblp 持续失败到底是什么原因
             # （403 封禁 / 429 限流 / 500 抽风，处理方式完全不同）。
             print(f"[dblp] 第 {attempt+1}/{max_retries} 次失败 status={resp.status_code} "
-                  f"body={resp.text[:200]!r}", flush=True)
+                  f"ct={ct!r} body={resp.text[:200]!r}", flush=True)
             time.sleep(CRAWL_DELAY * (attempt + 1))
-        except (requests.RequestException, ValueError, KeyError) as exc:
+        except (requests.RequestException, ValueError, KeyError, json.JSONDecodeError) as exc:
             print(f"[dblp] 第 {attempt+1}/{max_retries} 次异常 "
                   f"{type(exc).__name__}: {exc}", flush=True)
             time.sleep(CRAWL_DELAY * (attempt + 1))
@@ -165,8 +329,290 @@ OPENALEX_API = "https://api.openalex.org/works"
 # OpenAlex 的 polite pool 标识：带上邮箱能拿到更稳定的配额和更快的响应。
 # 不是密钥，不带也能用，只是会被归到匿名池。用环境变量而不是写死在代码里，
 # 免得把私人邮箱一起提交进仓库。
+# 2026 起匿名池按出口 IP 共享日预算，生产用法应配置免费 API key：
+#   OPENALEX_API_KEY / Authorization: Bearer …（见 https://help.openalex.org/api/authentication/）
 OPENALEX_MAILTO = os.environ.get("OPENALEX_MAILTO", "").strip()
+OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip()
 OPENALEX_BATCH = 50      # 一次用 filter=doi:a|b|c 查这么多篇
+
+CROSSREF_API = "https://api.crossref.org/works"
+CROSSREF_MAILTO = os.environ.get(
+    "CROSSREF_MAILTO",
+    OPENALEX_MAILTO or "talent-map@users.noreply.github.com",
+).strip()
+CROSSREF_PAGE = 100
+
+
+def _openalex_params(extra=None):
+    params = dict(extra or {})
+    if OPENALEX_MAILTO:
+        params.setdefault("mailto", OPENALEX_MAILTO)
+    if OPENALEX_API_KEY:
+        params.setdefault("api_key", OPENALEX_API_KEY)
+    return params
+
+
+def _openalex_headers():
+    if OPENALEX_API_KEY:
+        return {"Authorization": f"Bearer {OPENALEX_API_KEY}"}
+    return {}
+
+
+def _author_pid_from_name(name, prefix="xref"):
+    """无权威 ID 时，用归一化姓名生成稳定伪 pid（仅用于本图内合作边）。"""
+    tokens = sorted(normalize_person(name))
+    slug = "-".join(tokens) if tokens else "unknown"
+    return f"{prefix}:{slug}"
+
+
+def _openalex_author_pid(authorship):
+    author = authorship.get("author") or {}
+    oid = (author.get("id") or "").rstrip("/").split("/")[-1]
+    name = author.get("display_name") or ""
+    if oid:
+        return f"oa:{oid}", name
+    if name:
+        return _author_pid_from_name(name, prefix="oa"), name
+    return None, None
+
+
+def openalex_work_to_paper(work):
+    """把 OpenAlex work 转成 parse_authors / build_network 能吃的伪 dblp 记录。"""
+    title = work.get("display_name") or work.get("title") or ""
+    year = work.get("publication_year") or ""
+    doi = (work.get("doi") or "").replace("https://doi.org/", "").lower()
+    authors = []
+    inline = {}
+    for a in work.get("authorships") or []:
+        pid, name = _openalex_author_pid(a)
+        if not pid or not name:
+            continue
+        authors.append({"@pid": pid, "text": name})
+        inline[pid] = {
+            "institutions": [inst.get("display_name") for inst in (a.get("institutions") or [])
+                             if inst.get("display_name")],
+        }
+    if not authors:
+        return None
+    topics = [t.get("display_name") for t in (work.get("topics") or [])[:3] if t.get("display_name")]
+    return {
+        "info": {
+            "title": title,
+            "year": str(year) if year else "",
+            "doi": doi,
+            "authors": {"author": authors},
+        },
+        "_source": "openalex",
+        "_citations": int(work.get("cited_by_count") or 0),
+        "_topics": topics,
+        "_author_meta": inline,
+    }
+
+
+def crossref_work_to_paper(work):
+    """把 Crossref work 转成伪 dblp 记录。"""
+    title = (work.get("title") or [""])[0] if isinstance(work.get("title"), list) else (work.get("title") or "")
+    if not title:
+        return None
+    date_parts = (
+        (work.get("published-print") or {}).get("date-parts")
+        or (work.get("published-online") or {}).get("date-parts")
+        or (work.get("published") or {}).get("date-parts")
+        or (work.get("created") or {}).get("date-parts")
+        or [[]]
+    )
+    year = date_parts[0][0] if date_parts and date_parts[0] else ""
+    doi = (work.get("DOI") or "").lower()
+    authors = []
+    for a in work.get("author") or []:
+        given, family = a.get("given") or "", a.get("family") or ""
+        name = f"{given} {family}".strip() or a.get("name") or ""
+        if not name:
+            continue
+        orcid = (a.get("ORCID") or "").rstrip("/").split("/")[-1]
+        pid = f"orcid:{orcid}" if orcid else _author_pid_from_name(name, prefix="xref")
+        authors.append({"@pid": pid, "text": name})
+    if not authors:
+        return None
+    return {
+        "info": {
+            "title": title,
+            "year": str(year) if year else "",
+            "doi": doi,
+            "authors": {"author": authors},
+        },
+        "_source": "crossref",
+        "_citations": int(work.get("is-referenced-by-count") or 0),
+        "_topics": [],
+        "_author_meta": {},
+    }
+
+
+def apply_inline_paper_meta(G, papers):
+    """把 fallback 源自带的引用/机构/主题写进图（无需再打 OpenAlex enrich）。"""
+    per_pid = defaultdict(lambda: {"citations": 0, "institutions": Counter(), "topics": Counter()})
+    for paper in papers:
+        cites = int(paper.get("_citations") or 0)
+        topics = paper.get("_topics") or []
+        meta = paper.get("_author_meta") or {}
+        for pid, name in parse_authors(paper):
+            rec = per_pid[pid]
+            rec["citations"] += cites
+            for t in topics:
+                rec["topics"][t] += 1
+            for inst in (meta.get(pid) or {}).get("institutions") or []:
+                rec["institutions"][inst] += 1
+    apply_enrichment(G, per_pid)
+    return {
+        "enrich_status": "inline",
+        "enrich_message": "",
+        "degraded": False,
+        "papers_with_doi": sum(1 for p in papers if p.get("info", {}).get("doi")),
+        "papers_matched": len(papers),
+    }
+
+
+def collect_papers_openalex(query, max_papers, on_progress=None):
+    """关键词检索 OpenAlex；失败返回 ([], 0, reason)。"""
+    papers = []
+    total = 0
+    per_page = min(50, max_papers)
+    cursor = "*"
+    reason = ""
+    while len(papers) < max_papers:
+        params = _openalex_params({
+            "search": query,
+            "per_page": min(per_page, max_papers - len(papers)),
+            "cursor": cursor,
+            "select": "id,doi,display_name,publication_year,cited_by_count,authorships,topics",
+        })
+        try:
+            resp = SESSION.get(OPENALEX_API, params=params, headers=_openalex_headers(), timeout=40)
+        except requests.RequestException as exc:
+            reason = f"OpenAlex 网络错误：{type(exc).__name__}"
+            break
+        if resp.status_code == 429:
+            reason = "OpenAlex 配额用尽(429)，可配置 OPENALEX_API_KEY"
+            break
+        if resp.status_code != 200:
+            reason = f"OpenAlex HTTP {resp.status_code}"
+            break
+        try:
+            data = resp.json()
+        except ValueError:
+            reason = "OpenAlex 返回非 JSON"
+            break
+        results = data.get("results") or []
+        if total == 0:
+            total = int((data.get("meta") or {}).get("count") or 0)
+        if not results:
+            break
+        for work in results:
+            paper = openalex_work_to_paper(work)
+            if paper:
+                papers.append(paper)
+                if len(papers) >= max_papers:
+                    break
+        if on_progress:
+            on_progress(len(papers), min(max_papers, total or max_papers),
+                        f"OpenAlex 备用源已获取 {len(papers)} 篇")
+        cursor = (data.get("meta") or {}).get("next_cursor")
+        if not cursor:
+            break
+        time.sleep(0.35)
+    return papers, total or len(papers), reason
+
+
+def collect_papers_crossref(query, max_papers, on_progress=None):
+    """关键词检索 Crossref（礼貌池）；失败返回 ([], 0, reason)。"""
+    papers = []
+    total = 0
+    reason = ""
+    offset = 0
+    while len(papers) < max_papers:
+        rows = min(CROSSREF_PAGE, max_papers - len(papers))
+        params = {
+            "query": query,
+            "rows": rows,
+            "offset": offset,
+            "mailto": CROSSREF_MAILTO,
+        }
+        try:
+            resp = SESSION.get(CROSSREF_API, params=params, timeout=40)
+        except requests.RequestException as exc:
+            reason = f"Crossref 网络错误：{type(exc).__name__}"
+            break
+        if resp.status_code == 429:
+            reason = "Crossref 限流(429)"
+            time.sleep(2)
+            # 再试一次
+            try:
+                resp = SESSION.get(CROSSREF_API, params=params, timeout=40)
+            except requests.RequestException as exc:
+                reason = f"Crossref 网络错误：{type(exc).__name__}"
+                break
+        if resp.status_code != 200:
+            reason = f"Crossref HTTP {resp.status_code}"
+            break
+        try:
+            data = resp.json()
+        except ValueError:
+            reason = "Crossref 返回非 JSON"
+            break
+        msg = data.get("message") or {}
+        if total == 0:
+            total = int(msg.get("total-results") or 0)
+        items = msg.get("items") or []
+        if not items:
+            break
+        for work in items:
+            paper = crossref_work_to_paper(work)
+            if paper:
+                papers.append(paper)
+                if len(papers) >= max_papers:
+                    break
+        if on_progress:
+            on_progress(len(papers), min(max_papers, total or max_papers),
+                        f"Crossref 备用源已获取 {len(papers)} 篇")
+        if len(items) < rows:
+            break
+        offset += rows
+        time.sleep(0.2)
+    return papers, total or len(papers), reason
+
+
+def collect_papers_with_fallback(query, max_papers, on_progress=None):
+    """
+    先 dblp；若整页失败或零结果且像被拦，再试 OpenAlex，再试 Crossref。
+    返回 (papers, total, source, status_message)
+    source: "dblp" | "openalex" | "crossref"
+    """
+    papers, total = collect_papers(query, max_papers, on_progress)
+    if papers:
+        return papers, total, "dblp", ""
+
+    dblp_msg = "dblp 未返回论文（可能被 Anubis/网络拦截，或关键词无命中）"
+    if on_progress:
+        on_progress(0, 0, "dblp 无结果，尝试 OpenAlex 备用源…")
+    oa_papers, oa_total, oa_reason = collect_papers_openalex(query, max_papers, on_progress)
+    if oa_papers:
+        msg = f"主源 dblp 失败，已改用 OpenAlex（{len(oa_papers)} 篇）"
+        return oa_papers, oa_total, "openalex", msg
+
+    if on_progress:
+        on_progress(0, 0, "OpenAlex 不可用，尝试 Crossref 备用源…")
+    cr_papers, cr_total, cr_reason = collect_papers_crossref(query, max_papers, on_progress)
+    if cr_papers:
+        detail = oa_reason or dblp_msg
+        msg = f"主源 dblp 失败（{detail}），已改用 Crossref（{len(cr_papers)} 篇）"
+        return cr_papers, cr_total, "crossref", msg
+
+    parts = [dblp_msg]
+    if oa_reason:
+        parts.append(oa_reason)
+    if cr_reason:
+        parts.append(cr_reason)
+    return [], 0, "none", "；".join(parts)
 
 
 def normalize_person(name):
@@ -220,10 +666,9 @@ def enrich_from_openalex(papers, on_progress=None):
             "per_page": OPENALEX_BATCH * 2,
             "select": "doi,cited_by_count,authorships,topics",
         }
-        if OPENALEX_MAILTO:
-            params["mailto"] = OPENALEX_MAILTO
+        params = _openalex_params(params)
         try:
-            resp = SESSION.get(OPENALEX_API, params=params, timeout=40)
+            resp = SESSION.get(OPENALEX_API, params=params, headers=_openalex_headers(), timeout=40)
             if resp.status_code != 200:
                 batches_fail += 1
                 # Keep a short readable reason; quota exhaustion is the common public-trial case
@@ -542,12 +987,18 @@ def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=T
     """
     完整流程：联网检索 -> 建图 -> 补充属性 -> 聚类 -> 输出前端可用的数据。
     返回 dict，其中 error 非空表示这次检索没有可用结果。
+
+    主源是 dblp（含 Anubis PoW 自动通过）；若出口 IP 仍被硬拦或日配额耗尽，
+    自动降级到 OpenAlex / Crossref，并在 stats 里写明 data_source / source_message。
     """
-    papers, total_available = collect_papers(query, max_papers, on_progress)
+    papers, total_available, source, source_message = collect_papers_with_fallback(
+        query, max_papers, on_progress)
 
     if not papers:
-        return {"error": f"没有检索到「{query}」相关论文。dblp 的多个关键词之间是 AND 关系，"
-                         f"词越多结果越少，建议只用 1~2 个核心词。"}
+        detail = source_message or "所有数据源均无结果"
+        return {"error": f"没有检索到「{query}」相关论文。{detail}。"
+                         f"dblp 多个关键词之间是 AND 关系，建议只用 1~2 个核心词；"
+                         f"若长期失败可配置 OPENALEX_API_KEY 启用 OpenAlex 备用源。"}
 
     if on_progress:
         on_progress(len(papers), len(papers), "正在构建合作网络...")
@@ -562,9 +1013,22 @@ def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=T
         "enrich_message": "",
         "degraded": False,
     }
-    if enrich:
+    if source in ("openalex", "crossref"):
+        # fallback 记录已带引用/机构，直接写入；再打 enrich 只会浪费配额
+        coverage = apply_inline_paper_meta(G, papers)
+        if source_message:
+            coverage["degraded"] = True
+            coverage["enrich_message"] = source_message
+            coverage["enrich_status"] = "fallback"
+    elif enrich:
         enriched, coverage = enrich_from_openalex(papers, on_progress)
         apply_enrichment(G, enriched)
+        if source_message:
+            coverage["degraded"] = True
+            coverage["enrich_message"] = (
+                (coverage.get("enrich_message") + "；" if coverage.get("enrich_message") else "")
+                + source_message
+            )
 
     if on_progress:
         on_progress(len(papers), len(papers), "正在聚类研究团体...")
@@ -587,13 +1051,17 @@ def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=T
         "components": nx.number_connected_components(G),
         # 如实记录补充数据的覆盖率：OpenAlex 并非每篇论文都有机构元数据，
         # 界面上要让人知道有多少人是真拿到了数据，而不是默认全都有
-        "enriched": bool(enrich),
+        "enriched": bool(enrich) or source in ("openalex", "crossref"),
         "with_institution": with_inst,
         "with_citations": with_cite,
+        "data_source": source,
+        "source_message": source_message,
         **coverage,
     }
     payload["error"] = None
     payload["_graph"] = G   # 供深度模式接着扩展，序列化给前端之前会被去掉
+    # 非 dblp 源没有可靠的作者主页滚雪球接口，深度扩展会空转；交给 deep_expand 自行判断
+    payload["_data_source"] = source
     return payload
 
 
@@ -605,6 +1073,11 @@ def deep_expand(fast_payload, seed_count=15, per_seed=15, on_progress=None):
     G = fast_payload.get("_graph")
     if G is None or G.number_of_nodes() == 0:
         return {"error": "没有可用于扩展的检索结果"}
+
+    source = fast_payload.get("_data_source") or (fast_payload.get("stats") or {}).get("data_source") or "dblp"
+    if source != "dblp":
+        return {"error": f"当前结果来自备用源「{source}」，深度扩展依赖 dblp 作者检索，已跳过。"
+                         f"请待 dblp 恢复后重试深度模式。"}
 
     S = snowball_expand(G, seed_count, per_seed, on_progress)
 

@@ -4,6 +4,8 @@
 
 不依赖任何预设名单——每次检索都是现场从 dblp 全库拉数据构建的。可公开试用（内建限流与 OpenAlex 降级提示）。
 
+dblp 目前前置了 [Anubis](https://github.com/TecharoHQ/anubis) PoW 反爬；本项目会在普通 HTTP 客户端里自动完成挑战并复用 cookie。若出口 IP 仍被硬拦，会自动降级到 OpenAlex（需配额/API key）或 Crossref，并在界面标明数据源。
+
 ## P0 能力
 
 1. **快速检索（默认）**：关键词 → 可探索合作网络（Louvain 聚类、发文/引用切换节点大小、机构高亮）。深度模式为可选，**默认关闭**。
@@ -32,7 +34,8 @@ python3 app.py
 可选：
 
 ```bash
-export OPENALEX_MAILTO="your@email.com"   # OpenAlex polite pool，不设也能用
+export OPENALEX_MAILTO="your@email.com"   # OpenAlex polite pool / Crossref mailto
+export OPENALEX_API_KEY="..."             # 2026 起建议配置免费 key，避免匿名 IP 日预算耗尽
 export CONTACT_URL="https://example.com"  # 公开部署时建议设置，写入 User-Agent
 ```
 
@@ -55,6 +58,8 @@ docker run -p 7860:7860 -e OPENALEX_MAILTO="you@example.com" talent-map
 | 单访客并发限制 | 同一 IP 有检索在跑时拒绝新请求 | 防止单人占满全局队列 |
 | 参数上限收紧 | `papers`≤2000，`seeds`≤15 | 避免单次占队过久（命令行版不受限） |
 | OpenAlex 配额降级 | 用完或失败时主图仍返回，界面明示降级 | 不静默丢数据、不误导成「没有引用」 |
+| Anubis PoW | 自动完成 dblp 软挑战并缓存成功 JSON 页 | 恢复被反爬拦截的检索 API |
+| 备用论文源 | dblp 失败时依次试 OpenAlex、Crossref | 出口 IP 硬拦时仍能出图 |
 
 进程内缓存（30 分钟 TTL）仅单实例有效，**请单副本部署**。
 

@@ -508,7 +508,7 @@ PAGE = """<!DOCTYPE html>
       <div class="spinner hidden" id="spinner"></div>
       <div id="msg">输入一个论文方向，开始检索</div>
       <div id="sub">
-        数据来自 dblp 全网论文库，不限于任何预设名单。<br />
+        主数据源为 dblp；若被反爬拦截会自动改用 OpenAlex / Crossref，并在界面标明。<br />
         关键词建议只用 1~2 个核心词 —— dblp 多个词之间是 AND 关系，词越多结果越少
         （"BEV" 有 4979 篇，"BEV perception autonomous driving" 只剩 19 篇）。<br />
         dblp 要求每次请求间隔 4 秒，检索 300 篇约需 10 秒。<br />
@@ -641,7 +641,7 @@ function runSearch() {
   $('degradeBanner').style.display = 'none';
   $('listView').classList.remove('visible');
   setOverlay(true, { busy: true, msg: '正在检索「' + q + '」...',
-                     sub: '正在联网查询 dblp 论文库', progress: true, percent: 0 });
+                     sub: '正在联网查询论文库（dblp，必要时自动备用源）', progress: true, percent: 0 });
 
   var deep = $('deepInput').checked;
   $('deepBanner').style.display = 'none';
@@ -795,10 +795,18 @@ function render(data) {
   if (s.enriched) {
     txt += ' · 引用数 ' + s.with_citations + ' 人 / 署名机构 ' + s.with_institution + ' 人';
   }
-  if (s.degraded || s.enrich_status === 'degraded' || s.enrich_status === 'partial') {
-    txt += ' · 补充已降级';
+  if (s.data_source && s.data_source !== 'dblp') {
+    txt += ' · 数据源 ' + s.data_source + '（备用）';
+  } else if (s.data_source === 'dblp') {
+    txt += ' · 数据源 dblp';
+  }
+  if (s.degraded || s.enrich_status === 'degraded' || s.enrich_status === 'partial'
+      || s.enrich_status === 'fallback' || (s.source_message && s.data_source && s.data_source !== 'dblp')) {
+    if (s.enrich_status === 'degraded' || s.enrich_status === 'partial') {
+      txt += ' · 补充已降级';
+    }
     $('degradeBanner').style.display = 'block';
-    $('degradeBanner').textContent = s.enrich_message
+    $('degradeBanner').textContent = s.source_message || s.enrich_message
       || '引用/机构补充已降级：配额用尽或接口失败（主图仍可用，详情与短名单会标缺口）';
   } else {
     $('degradeBanner').style.display = 'none';
