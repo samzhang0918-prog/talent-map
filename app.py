@@ -13,6 +13,8 @@ dblp 的 robots.txt 要求 Crawl-delay 4 秒，抓 300 篇论文（3 页）就�
 
 缓存：同一个关键词 + 参数在 30 分钟内重复搜索会直接命中内存缓存，
 既让用户秒出结果，也避免对 dblp 反复发起相同的抓取。
+时间范围（全部 / 近 5 年 / 近 3 年）只影响建图，不影响抓取：抓到的原始论文和
+OpenAlex 补充数据按「关键词 + 论文数」单独缓存，切换范围时直接在这份数据上过滤重算。
 """
 
 import asyncio
@@ -95,7 +97,7 @@ def strip_internal(payload):
 
 @app.get("/api/search")
 async def search(request: Request, q: str, papers: int = 300, min_papers: int = 2,
-                 deep: bool = False, seeds: int = 10):
+                 deep: bool = False, seeds: int = 10, years: str = "all"):
     """
     SSE 流式接口：边抓边推进度，最后推完整结果。
 
@@ -109,6 +111,9 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
     深度模式为什么分两段推：快速结果十几秒就能出来，滚雪球还要每个种子一次请求
     （6 秒间隔，15 个种子约 90 秒）。先把能看的图给用户，再在后台把连通性补上，
     比让人对着转圈等两分钟好得多。
+
+    years: all / 5 / 3（也接受 5y / 3y）。按论文发表年份过滤、含当年，
+    口径见 topic_graph.resolve_time_range；结果 stats.time_range 里带着范围描述。
     """
     q = (q or "").strip()
     # 公开部署时把上限收紧一些：papers=10000 (dblp 硬上限) 单次要抓 7 分钟以上，
@@ -117,6 +122,8 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
     papers = max(100, min(papers, PUBLIC_MAX_PAPERS))
     min_papers = max(1, min(min_papers, 20))
     seeds = max(3, min(seeds, PUBLIC_MAX_SEEDS))
+    time_range = topic_graph.resolve_time_range(years)
+    range_key = time_range["key"]
     client_ip = get_client_ip(request)
 
     async def event_stream():
@@ -149,11 +156,25 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
             # 否则会卡住整个事件循环，连已经产生的进度都推不出去。
             def worker():
                 try:
-                    fast_key = f"{q}|{papers}|{min_papers}"
+                    # 时间范围写进 key；缓存跨自然年时 resolve_time_range 的起止年会变，
+                    # 所以连同具体年份一起放进去，避免跨年后命中旧口径
+                    range_sig = f"{range_key}:{time_range['start']}-{time_range['end']}"
+                    fast_key = f"{q}|{papers}|{min_papers}|{range_sig}"
                     fast = cache_get(fast_key)
                     if fast is None:
-                        fast = topic_graph.search_topic(
-                            q, papers, min_papers, make_reporter("progress"))
+                        # 原始论文 + OpenAlex 补充与时间范围无关，单独缓存：
+                        # 同一关键词切换范围时不再打 dblp / OpenAlex，只在本地重算
+                        raw_key = f"raw|{q}|{papers}"
+                        raw = cache_get(raw_key)
+                        if raw is None:
+                            raw = topic_graph.fetch_topic_papers(
+                                q, papers, make_reporter("progress"))
+                            if raw.get("papers"):
+                                cache_put(raw_key, raw)
+                        else:
+                            make_reporter("progress")(0, 0, "已抓取过该关键词，按所选时间范围重新统计…")
+                        fast = topic_graph.build_topic_payload(
+                            raw, min_papers, time_range, make_reporter("progress"))
                         if not fast.get("error"):
                             cache_put(fast_key, fast)
                     else:
@@ -164,7 +185,7 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
                         loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
                         return
 
-                    deep_key = f"{q}|{papers}|{min_papers}|deep{seeds}"
+                    deep_key = f"{q}|{papers}|{min_papers}|{range_sig}|deep{seeds}"
                     deep_res = cache_get(deep_key)
                     if deep_res is None:
                         deep_res = topic_graph.deep_expand(
@@ -224,7 +245,11 @@ def sse(event, data):
 
 @app.get("/api/presets")
 async def presets():
-    return {"topics": topic_graph.PRESET_TOPICS}
+    return {
+        "topics": topic_graph.PRESET_TOPICS,
+        # 时间范围选项的文案（含具体起止年份）由后端给出，与结果里的 stats.time_range 同源
+        "time_ranges": [topic_graph.resolve_time_range(k) for k in ("all", "5y", "3y")],
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -309,6 +334,12 @@ PAGE = """<!DOCTYPE html>
   }
   .chip:hover { background: #45475a; color: #cdd6f4; }
   .chip.suggest { border-color: #89b4fa; color: #89b4fa; }
+  #scopeBar {
+    display: none; padding: 7px 22px; font-size: 12.5px; line-height: 1.5;
+    background: rgba(137,180,250,.10); border-bottom: 1px solid #45475a; color: #bac2de;
+  }
+  #scopeBar b { color: #89b4fa; font-weight: 600; }
+  #scopeBar .scopeNote { color: #7f849c; }
   main { flex: 1; min-height: 0; position: relative; }
   #graph { position: absolute; inset: 0; }
   #listView {
@@ -428,6 +459,13 @@ PAGE = """<!DOCTYPE html>
     <input id="topicInput" placeholder="输入论文方向关键词，如 BEV perception、occupancy prediction" autocomplete="off" />
     <div class="opt">论文数 <input id="papersInput" type="number" value="300" min="100" max="10000" step="100" /></div>
     <div class="opt">最少发文 <input id="minInput" type="number" value="2" min="1" max="20" /></div>
+    <div class="opt" title="按论文发表年份过滤（含当年）。结构图、短名单、CSV 的发文数、方向核心判定、合作关系、引用与排序都只统计该范围内的论文。已检索过的关键词切换范围不会重新抓取 dblp。">时间范围
+      <select id="rangeSelect">
+        <option value="all">全部</option>
+        <option value="5">近 5 年</option>
+        <option value="3">近 3 年</option>
+      </select>
+    </div>
     <div class="opt">节点大小
       <select id="sizeMode">
         <option value="papers">按发文量</option>
@@ -445,6 +483,7 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div id="presets"></div>
 </header>
+<div id="scopeBar"></div>
 
 <main>
   <div id="graph"></div>
@@ -470,8 +509,8 @@ PAGE = """<!DOCTYPE html>
           <tr>
             <th>姓名</th>
             <th>论文署名机构（发表当时）</th>
-            <th>方向发文</th>
-            <th>方向相关引用</th>
+            <th id="thPapers">方向发文</th>
+            <th id="thCites">方向相关引用</th>
             <th>角色</th>
             <th>团体/聚类</th>
             <th>Scholar 搜索</th>
@@ -556,12 +595,55 @@ function gapMarkers(n) {
   return gaps;
 }
 
+function currentRange() {
+  // 以「当前展示的结果」的口径为准（而不是下拉框的值），保证界面与 CSV 一致
+  var tr = (lastStats && lastStats.time_range) || null;
+  return tr || { key: 'all', years: null, label: '全部年份', basis: '按论文发表年份，含当年' };
+}
+
+function rangeShort() {
+  var tr = currentRange();
+  return tr.years ? ('近 ' + tr.years + ' 年') : '全部年份';
+}
+
+function rangeFullText() {
+  var tr = currentRange();
+  return tr.years ? (tr.label + '，' + tr.basis) : '全部年份（不按年份过滤）';
+}
+
+function renderScopeBar() {
+  var s = lastStats || {};
+  var tr = currentRange();
+  var html = '当前时间范围：<b>' + esc(tr.label) + '</b>';
+  if (tr.years) {
+    html += ' · ' + esc(tr.basis) + ' · 范围内论文 ' + esc(s.papers_in_range) + ' / 已抓取 '
+      + esc(s.papers_fetched) + ' 篇';
+  } else {
+    html += ' · 已抓取论文 ' + esc(s.papers_fetched) + ' 篇';
+    if (s.papers_year_min && s.papers_year_max) {
+      html += '（年份 ' + esc(s.papers_year_min) + '–' + esc(s.papers_year_max) + '）';
+    }
+  }
+  html += ' <span class="scopeNote">· 结构图、短名单与 CSV 的发文数、方向核心判定、合作关系、聚类、引用与排序均只统计该范围内论文'
+    + (tr.years ? '；引用 = 范围内论文至今的累计被引' : '') + '</span>';
+  $('scopeBar').innerHTML = html;
+  $('scopeBar').style.display = 'block';
+  var suffix = tr.years ? '（' + rangeShort() + '）' : '';
+  $('thPapers').textContent = '方向发文' + suffix;
+  $('thCites').textContent = '方向相关引用' + suffix;
+}
+
 function citationDisplay(n) {
   // Missing enrichment must stay blank — do not show 0 as if it were a real count
   return n.citations ? String(n.citations) : '';
 }
 
 fetch('/api/presets').then(function (r) { return r.json(); }).then(function (d) {
+  (d.time_ranges || []).forEach(function (tr) {
+    var v = tr.years ? String(tr.years) : 'all';
+    var opt = $('rangeSelect').querySelector('option[value="' + v + '"]');
+    if (opt) opt.textContent = tr.years ? tr.label : '全部';
+  });
   var box = $('presets');
   d.topics.forEach(function (t) {
     var c = document.createElement('span');
@@ -639,6 +721,7 @@ function runSearch() {
   $('stats').style.display = 'none';
   $('viewToggle').style.display = 'none';
   $('degradeBanner').style.display = 'none';
+  $('scopeBar').style.display = 'none';
   $('listView').classList.remove('visible');
   setOverlay(true, { busy: true, msg: '正在检索「' + q + '」...',
                      sub: '正在联网查询论文库（dblp，必要时自动备用源）', progress: true, percent: 0 });
@@ -648,7 +731,8 @@ function runSearch() {
   var url = '/api/search?q=' + encodeURIComponent(q)
           + '&papers=' + encodeURIComponent($('papersInput').value)
           + '&min_papers=' + encodeURIComponent($('minInput').value)
-          + '&deep=' + (deep ? 'true' : 'false');
+          + '&deep=' + (deep ? 'true' : 'false')
+          + '&years=' + encodeURIComponent($('rangeSelect').value);
   var es = new EventSource(url);
   currentES = es;
 
@@ -781,15 +865,19 @@ function render(data) {
   $('searchPanel').style.display = currentView === 'graph' ? 'block' : 'none';
   $('viewToggle').style.display = 'flex';
 
+  renderScopeBar();
   var s = data.stats || {};
   var txt;
+  var tr0 = currentRange();
+  var rangePrefix = tr0.years ? (tr0.label + ' · ') : '全部年份 · ';
+  var inRange = tr0.years ? '（范围内 ' + s.papers_in_range + ' 篇）' : '';
   if (s.mode === 'deep') {
-    txt = '深度模式 · 检索 ' + s.papers_fetched + ' / ' + s.papers_available + ' 篇论文 · '
+    txt = rangePrefix + '深度模式 · 检索 ' + s.papers_fetched + ' / ' + s.papers_available + ' 篇论文' + inRange + ' · '
         + s.seed_count + ' 位方向核心学者 + 合作圈共 ' + s.scholars + ' 人 · 合作关系 '
         + s.relations + ' 条 · 独立网络 ' + s.components + ' 个 · 研究团体 ' + s.communities + ' 个';
   } else {
-    txt = '检索 ' + s.papers_fetched + ' / ' + s.papers_available
-        + ' 篇论文 · 方向核心 ' + s.scholars + ' 位（该方向发文 ≥ ' + s.min_papers + ' 篇）· 合作关系 '
+    txt = rangePrefix + '检索 ' + s.papers_fetched + ' / ' + s.papers_available
+        + ' 篇论文' + inRange + ' · 方向核心 ' + s.scholars + ' 位（该方向发文 ≥ ' + s.min_papers + ' 篇）· 合作关系 '
         + s.relations + ' 条 · 独立网络 ' + s.components + ' 个 · 研究团体 ' + s.communities + ' 个';
   }
   if (s.enriched) {
@@ -1008,12 +1096,14 @@ function openDetail(id) {
   }
 
   html += field('角色', esc(roleLabel(n)), roleLabel(n));
+  html += field('时间范围', esc(rangeFullText()), rangeFullText());
+  var rSuffix = currentRange().years ? '（' + rangeShort() + '）' : '';
   if (n.is_seed !== false) {
-    html += field('该方向发文', esc(n.papers) + ' 篇', String(n.papers));
+    html += field('该方向发文' + rSuffix, esc(n.papers) + ' 篇', String(n.papers));
   } else {
-    html += field('该方向发文', '—（经关联引入，非该方向检索命中）', '');
+    html += field('该方向发文' + rSuffix, '—（经关联引入，非该方向检索命中）', '');
   }
-  html += field('该方向相关引用',
+  html += field('该方向相关引用' + rSuffix,
     n.citations ? (esc(n.citations) + ' 次') : '<span style="color:#f9e2af">未补全 / 缺引用</span>',
     n.citations ? String(n.citations) : '');
   html += field('论文署名机构（发表当时）',
@@ -1070,6 +1160,7 @@ function openDetail(id) {
     var lines = [
       '姓名: ' + n.label,
       '角色: ' + roleLabel(n),
+      '时间范围: ' + rangeFullText(),
       '该方向发文: ' + (n.is_seed === false ? '' : n.papers),
       '该方向相关引用: ' + citationDisplay(n),
       '论文署名机构（发表当时）: ' + (n.institution || ''),
@@ -1147,7 +1238,7 @@ function renderShortlist() {
     if (b.papers !== a.papers) return b.papers - a.papers;
     return (b.citations || 0) - (a.citations || 0);
   });
-  $('listMeta').textContent = '显示 ' + rows.length + ' / ' + allNodes.length + ' 人';
+  $('listMeta').textContent = '显示 ' + rows.length + ' / ' + allNodes.length + ' 人 · 时间范围：' + currentRange().label;
   var body = $('listBody');
   body.innerHTML = '';
   if (!rows.length) {
@@ -1186,10 +1277,12 @@ function exportCsv() {
     '# Google Scholar 列为作者搜索页 URL，非精确个人主页；同名需人工甄别。',
     '# 方向相关引用/机构可能因 OpenAlex 配额用尽、接口失败或元数据缺口而缺失（留空，勿当作 0）。',
     '# 查询词: ' + (lastQuery || ''),
+    '# 时间范围: ' + rangeFullText() + '；发文数、方向核心判定、合作关系、聚类、引用与排序均只统计该范围内论文'
+      + (currentRange().years ? '（引用 = 范围内论文至今的累计被引）' : ''),
     '# 导出时间(本地): ' + new Date().toLocaleString()
   ];
   var header = ['姓名', '论文署名机构（发表当时）', '方向发文数', '方向相关引用',
-                '角色标签', '团体/聚类ID', 'Scholar搜索URL', '数据置信/缺口标记'];
+                '角色标签', '团体/聚类ID', 'Scholar搜索URL', '数据置信/缺口标记', '时间范围'];
   function csvCell(v) {
     var s = String(v == null ? '' : v);
     if (/[",\\n\\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
@@ -1205,14 +1298,17 @@ function exportCsv() {
       roleLabel(n),
       n.community,
       scholarSearchUrl(n),
-      gapMarkers(n).join('; ')
+      gapMarkers(n).join('; '),
+      currentRange().label
     ].map(csvCell).join(','));
   });
   // UTF-8 BOM so Excel on Windows opens Chinese correctly
   var blob = new Blob(['\\ufeff' + lines.join('\\n')], { type: 'text/csv;charset=utf-8' });
   var a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'talent-shortlist-' + (lastQuery || 'export').replace(/ +/g, '_') + '.csv';
+  var tr = currentRange();
+  a.download = 'talent-shortlist-' + (lastQuery || 'export').replace(/ +/g, '_')
+    + '-' + (tr.years ? (tr.start + '-' + tr.end) : 'all-years') + '.csv';
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
 }
@@ -1240,6 +1336,11 @@ $('listClusterFilter').onchange = function () { renderShortlist(); };
 $('listCoreOnly').onchange = function () { renderShortlist(); };
 $('listHasInst').onchange = function () { renderShortlist(); };
 $('exportCsvBtn').onclick = exportCsv;
+// 已有结果时切换时间范围直接重跑：后端复用已抓取的论文，只按新范围重新统计。
+// 检索进行中不打断（同一访客不能并发检索），新范围在下次检索时生效。
+$('rangeSelect').onchange = function () {
+  if (allNodes.length && lastQuery && !$('goBtn').disabled) runSearch();
+};
 
 var nsTimer;
 $('nodeSearch').addEventListener('input', function (e) {

@@ -15,6 +15,7 @@ dblp 目前前置了 [Anubis](https://github.com/TecharoHQ/anubis) PoW 反爬；
 5. **关键词放宽提示**：空结果或 AND 过严时，给出可点选建议（只保留首词 / 去掉末词等），点选后重搜。预置 chip 仍可用。
 6. **限流 / 降级可读**：同 IP 并发限流有明确错误文案；OpenAlex 配额用尽或补充失败时，主图仍可用，stats/条幅显示「引用/机构补充已降级…」，详情卡与短名单标注缺口。
 7. **短名单视图**：结构图旁「结构图 | 短名单」切换。表格字段：姓名、论文署名机构（发表当时）、方向发文、方向相关引用（缺失留空）、角色、团体/聚类 ID、Scholar 搜索 URL、缺口标记。筛选含最少发文、仅方向核心、是否有机构、聚类、姓名关键字。UTF-8 CSV 导出含免责声明。
+8. **时间范围筛选**：全部 / 近 5 年 / 近 3 年。口径：按论文发表年份、以当前年份为基准、含当年（2026 年时近 5 年 = 2022–2026，近 3 年 = 2024–2026）；年份缺失或标为未来年份的论文只计入「全部」。结构图、短名单、CSV 的发文数、方向核心判定（最少发文阈值）、合作边、聚类、引用/机构聚合与排序都只用范围内论文；引用 = 范围内论文至今的累计被引。界面顶部条幅、统计栏、短名单表头、详情卡与 CSV（注释行 + 「时间范围」列 + 文件名）都注明当前范围。过滤作用在**已抓取的论文**上：切换范围复用已抓取的 dblp 论文与 OpenAlex 补充，只在本地重新建图，不重新请求。
 
 ## 不做（当前范围外）
 
@@ -69,6 +70,7 @@ docker run -p 7860:7860 -e OPENALEX_MAILTO="you@example.com" talent-map
 python3 talent_map_by_topic.py "BEV perception"
 python3 talent_map_by_topic.py "occupancy prediction" --papers 2000 --min-papers 3
 python3 talent_map_by_topic.py "corner case" --deep --seeds 10
+python3 talent_map_by_topic.py "lane detection" --years 3   # 只统计近 3 年（含当年）
 python3 talent_map_by_topic.py --list
 ```
 

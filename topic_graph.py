@@ -17,6 +17,7 @@
 """
 
 import colorsys
+import datetime
 import hashlib
 import json
 import os
@@ -86,7 +87,9 @@ _DBLP_LAST = 0.0
 _DBLP_RESP_CACHE = {}
 _DBLP_RESP_CACHE_TTL = 20 * 60
 _DBLP_RESP_CACHE_LOCK = threading.Lock()
-_DBLP_RESP_CACHE_MAX = 64
+# 滚雪球（深度模式）的作者检索也走这份缓存，切换时间范围重跑深度模式时可复用，
+# 所以比只缓存翻页时放大一些。每条是一页 ≤100 条的 dblp JSON，内存开销很小。
+_DBLP_RESP_CACHE_MAX = 128
 
 # Anubis（Techaro）保护：dblp 对疑似自动化流量返回 PoW 挑战页，浏览器解完后
 # 拿 auth cookie。这是站点正常的 soft challenge，用同样的 HTTP 客户端完成即可。
@@ -323,6 +326,79 @@ def collect_papers(query, max_papers, on_progress=None):
         # 翻页间隔由 dblp_get 的全局节流统一负责，这里不再单独 sleep
 
     return papers, (total or 0)
+
+
+# ---------------------------------------------------------------------------
+# 时间范围筛选
+#
+# 口径：按论文自身的发表年份（dblp / OpenAlex / Crossref 记录里的 year 字段）过滤，
+# 以当前自然年为基准、含当年：「近 N 年」= [当前年-N+1, 当前年]。
+# 例如当前 2026 年：近 5 年 = 2022–2026，近 3 年 = 2024–2026。
+# 年份缺失/无法解析的论文、以及标注为未来年份（如 dblp 里提前挂出的次年卷期）的论文
+# 不属于任何有限范围，只在「全部」里计入。
+#
+# 过滤发生在「已抓取的论文」上：切换范围不重新打 dblp / OpenAlex，只是用范围内的
+# 论文重新建图——发文数、方向核心判定（最少发文阈值）、合作边、聚类、引用/机构
+# 聚合、排序全部只用范围内论文，结构图 / 短名单 / CSV 共用同一份结果，口径天然一致。
+# ---------------------------------------------------------------------------
+TIME_RANGE_CHOICES = {"all": None, "5y": 5, "3y": 3}
+TIME_RANGE_BASIS = "按论文发表年份，含当年"
+
+
+def normalize_time_range(value):
+    """把 'all' / '5' / '5y' / 3 / None 之类的输入规整成 TIME_RANGE_CHOICES 的 key；非法值回落到 all。"""
+    if value is None:
+        return "all"
+    v = str(value).strip().lower()
+    if v in ("", "all", "0", "none", "全部"):
+        return "all"
+    if not v.endswith("y"):
+        v += "y"
+    return v if v in TIME_RANGE_CHOICES else "all"
+
+
+def resolve_time_range(value, current_year=None):
+    """
+    返回时间范围描述 dict：
+      key: all / 5y / 3y；years: None 或 N；start/end: 年份（all 时为 None）；
+      label: 界面/CSV 用的短标签，如「近 3 年（2024–2026）」；basis: 口径说明。
+    """
+    key = normalize_time_range(value)
+    n = TIME_RANGE_CHOICES[key]
+    cur = int(current_year or datetime.date.today().year)
+    if n is None:
+        return {"key": "all", "years": None, "start": None, "end": None,
+                "current_year": cur, "label": "全部年份", "basis": TIME_RANGE_BASIS}
+    start = cur - n + 1
+    return {"key": key, "years": n, "start": start, "end": cur, "current_year": cur,
+            "label": f"近 {n} 年（{start}–{cur}）", "basis": TIME_RANGE_BASIS}
+
+
+def paper_year(paper):
+    """取论文年份（int）；缺失或无法解析返回 None。"""
+    raw = str((paper.get("info") or {}).get("year") or "").strip()
+    m = re.match(r"^(\d{4})", raw)
+    return int(m.group(1)) if m else None
+
+
+def filter_papers_by_time_range(papers, time_range):
+    """
+    按时间范围过滤论文，返回 (范围内论文, 统计)。
+    统计：in_range / out_of_range（有年份但不在范围内，含未来年份）/ no_year。
+    time_range 为 all 时原样返回全部论文（年份缺失的也保留）。
+    """
+    no_year = sum(1 for p in papers if paper_year(p) is None)
+    if not time_range or time_range.get("years") is None:
+        return list(papers), {"in_range": len(papers), "out_of_range": 0, "no_year": no_year}
+    start, end = time_range["start"], time_range["end"]
+    kept = []
+    for p in papers:
+        y = paper_year(p)
+        if y is not None and start <= y <= end:
+            kept.append(p)
+    return kept, {"in_range": len(kept),
+                  "out_of_range": len(papers) - len(kept) - no_year,
+                  "no_year": no_year}
 
 
 OPENALEX_API = "https://api.openalex.org/works"
@@ -635,15 +711,31 @@ def enrich_from_openalex(papers, on_progress=None):
     成本上也差得远：按人名查用的是全文 search，一次 10 credits；按 DOI 用 filter
     精确匹配，一次请求带 50 个 DOI 只花 1 credit。每天 1000 credits 够查 5 万篇论文。
 
+    实现上拆成两步：fetch_openalex_works（联网，每批论文只做一次）+
+    aggregate_openalex_works（纯本地，按任意论文子集聚合）。时间范围筛选靠第二步
+    在不重新请求 OpenAlex 的前提下，只用范围内论文重算引用/机构/主题。
+
     返回 {dblp_pid: {"citations": int, "institutions": Counter, "topics": Counter}}
     """
-    by_doi = {}
+    works_by_doi, coverage = fetch_openalex_works(papers, on_progress)
+    return aggregate_openalex_works(papers, works_by_doi), coverage
+
+
+def fetch_openalex_works(papers, on_progress=None):
+    """
+    联网部分：按 DOI 批量取 OpenAlex work，返回 (works_by_doi, coverage)。
+    works_by_doi: {doi: [{"citations": int, "topics": [...], "oa_authors": {姓名词集: [机构...]}}, ...]}
+    （同一 DOI 偶尔会对应多条 OpenAlex 记录，保持原实现的逐条累加语义，所以存列表。）
+    """
+    dois = []
+    seen = set()
     for p in papers:
         doi = (p.get("info", {}).get("doi") or "").lower()
-        if doi:
-            by_doi.setdefault(doi, []).append(p)
+        if doi and doi not in seen:
+            seen.add(doi)
+            dois.append(doi)
 
-    if not by_doi:
+    if not dois:
         return {}, {
             "papers_with_doi": 0,
             "papers_matched": 0,
@@ -652,8 +744,8 @@ def enrich_from_openalex(papers, on_progress=None):
             "degraded": False,
         }
 
-    dois = list(by_doi)
-    enriched = defaultdict(lambda: {"citations": 0, "institutions": Counter(), "topics": Counter()})
+    works_by_doi = defaultdict(list)
+    seq = 0   # OpenAlex 返回顺序；聚合时按它遍历，保证机构/主题并列时的取舍与原实现一致
     matched_papers = 0
     batches_ok = 0
     batches_fail = 0
@@ -691,30 +783,22 @@ def enrich_from_openalex(papers, on_progress=None):
 
         for work in results:
             doi = (work.get("doi") or "").replace("https://doi.org/", "").lower()
-            dblp_papers = by_doi.get(doi)
-            if not dblp_papers:
+            if doi not in seen:
                 continue
             matched_papers += 1
 
-            citations = work.get("cited_by_count") or 0
-            topics = [t["display_name"] for t in (work.get("topics") or [])[:3]]
-
-            # 建同篇论文内的 OpenAlex 作者索引，再和 dblp 的署名对上号
+            # 建同篇论文内的 OpenAlex 作者索引，后面再和 dblp 的署名对上号
             oa_authors = {}
             for a in work.get("authorships", []):
                 key = normalize_person(a.get("author", {}).get("display_name", ""))
                 oa_authors[key] = [inst["display_name"] for inst in a.get("institutions", [])]
-
-            for dblp_paper in dblp_papers:
-                for pid, name in parse_authors(dblp_paper):
-                    rec = enriched[pid]
-                    rec["citations"] += citations
-                    for t in topics:
-                        rec["topics"][t] += 1
-                    insts = oa_authors.get(normalize_person(name))
-                    if insts:
-                        for inst in insts:
-                            rec["institutions"][inst] += 1
+            seq += 1
+            works_by_doi[doi].append({
+                "seq": seq,
+                "citations": work.get("cited_by_count") or 0,
+                "topics": [t["display_name"] for t in (work.get("topics") or [])[:3]],
+                "oa_authors": oa_authors,
+            })
 
         if on_progress:
             on_progress(min(i + OPENALEX_BATCH, len(dois)), len(dois),
@@ -745,7 +829,36 @@ def enrich_from_openalex(papers, on_progress=None):
         "enrich_batches_ok": batches_ok,
         "enrich_batches_fail": batches_fail,
     }
-    return dict(enriched), coverage
+    return dict(works_by_doi), coverage
+
+
+def aggregate_openalex_works(papers, works_by_doi):
+    """
+    纯本地：只用传入的这批论文（例如时间范围内的论文）聚合每位作者的引用/机构/主题。
+    没匹配上 OpenAlex 的论文不贡献任何值——引用保持 0，前端据此留空、不当作真实的 0。
+    """
+    by_doi = {}
+    for p in papers:
+        doi = (p.get("info", {}).get("doi") or "").lower()
+        if doi:
+            by_doi.setdefault(doi, []).append(p)
+    # 按 OpenAlex 返回顺序遍历（Counter.most_common 并列时取先插入者，顺序影响机构/主题取舍）
+    works = sorted(((w["seq"], doi, w) for doi in by_doi for w in works_by_doi.get(doi) or ()),
+                   key=lambda x: x[0])
+
+    enriched = defaultdict(lambda: {"citations": 0, "institutions": Counter(), "topics": Counter()})
+    for _, doi, work in works:
+        for dblp_paper in by_doi[doi]:
+            for pid, name in parse_authors(dblp_paper):
+                rec = enriched[pid]
+                rec["citations"] += work["citations"]
+                for t in work["topics"]:
+                    rec["topics"][t] += 1
+                insts = work["oa_authors"].get(normalize_person(name))
+                if insts:
+                    for inst in insts:
+                        rec["institutions"][inst] += 1
+    return dict(enriched)
 
 
 def parse_authors(paper):
@@ -903,18 +1016,24 @@ def fetch_author_papers(name, max_retries=3):
     混进来的同名他人论文，靠调用方用 pid 精确过滤即可剔除，不影响准确性。
     """
     url = f"{DBLP_API}?q={urllib.parse.quote_plus(name)}&format=json&h={PAGE_SIZE}"
+    # 切换时间范围后重跑深度模式时，同一位种子不必再打一次 dblp
+    cached = _dblp_cache_get(url)
+    if cached is not None:
+        return cached
     for attempt in range(max_retries):
         try:
             resp = dblp_get(url, SNOWBALL_DELAY)
             if resp.status_code == 200:
-                return resp.json()["result"]["hits"].get("hit", [])
+                hits = resp.json()["result"]["hits"].get("hit", [])
+                _dblp_cache_put(url, hits)
+                return hits
             time.sleep(SNOWBALL_DELAY * (attempt + 1))
         except (requests.RequestException, ValueError, KeyError):
             time.sleep(SNOWBALL_DELAY * (attempt + 1))
     return None
 
 
-def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None):
+def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None, time_range=None):
     """
     以该方向发文最多的学者为种子做滚雪球扩展，把他们的合作者也纳入图中。
 
@@ -929,6 +1048,8 @@ def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None):
 
     代价是图里会混入不做这个方向的人（种子的其他领域合作者），所以节点上用 is_seed
     区分：种子是该方向的核心学者，其余是被带进来的协作圈。
+
+    time_range 非「全部」时，种子作者的论文也只取范围内的，合作边口径与快速结果一致。
     """
     seeds = [pid for pid, _ in sorted(
         G.nodes(data=True), key=lambda x: -x[1]["papers"])[:seed_count]]
@@ -953,6 +1074,9 @@ def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None):
                         f"正在扩展 {name} 的合作网络（{done}/{len(seeds)}）")
         if hits is None:
             continue
+
+        if time_range and time_range.get("years") is not None:
+            hits, _ = filter_papers_by_time_range(hits, time_range)
 
         collab = Counter()
         names = {}
@@ -983,30 +1107,63 @@ def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None):
     return S
 
 
-def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=True):
+def fetch_topic_papers(query, max_papers=300, on_progress=None, enrich=True):
     """
-    完整流程：联网检索 -> 建图 -> 补充属性 -> 聚类 -> 输出前端可用的数据。
-    返回 dict，其中 error 非空表示这次检索没有可用结果。
-
-    主源是 dblp（含 Anubis PoW 自动通过）；若出口 IP 仍被硬拦或日配额耗尽，
-    自动降级到 OpenAlex / Crossref，并在 stats 里写明 data_source / source_message。
+    联网部分：检索论文（dblp，失败时降级 OpenAlex / Crossref），dblp 源再按 DOI
+    向 OpenAlex 取引用/机构/主题。结果与时间范围无关，可以缓存起来给不同时间范围复用：
+    切换范围时只需 build_topic_payload 重新建图，不用再打 dblp / OpenAlex。
     """
     papers, total_available, source, source_message = collect_papers_with_fallback(
         query, max_papers, on_progress)
+    raw = {
+        "query": query,
+        "papers": papers,
+        "total_available": total_available,
+        "source": source,
+        "source_message": source_message,
+        "enrich": bool(enrich),
+        "works_by_doi": None,
+        "enrich_coverage": None,
+    }
+    if papers and source == "dblp" and enrich:
+        raw["works_by_doi"], raw["enrich_coverage"] = fetch_openalex_works(papers, on_progress)
+    return raw
 
-    if not papers:
+
+def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
+    """
+    纯本地部分：按时间范围过滤已抓到的论文 -> 建图 -> 写入补充属性 -> 聚类 -> 前端 JSON。
+    发文数、方向核心判定、合作边、聚类、引用/机构聚合都只用范围内论文。
+    """
+    tr = time_range if isinstance(time_range, dict) else resolve_time_range(time_range)
+    query = raw["query"]
+    all_papers = raw["papers"]
+    total_available = raw["total_available"]
+    source = raw["source"]
+    source_message = raw["source_message"]
+    enrich = raw["enrich"]
+
+    if not all_papers:
         detail = source_message or "所有数据源均无结果"
         return {"error": f"没有检索到「{query}」相关论文。{detail}。"
                          f"dblp 多个关键词之间是 AND 关系，建议只用 1~2 个核心词；"
                          f"若长期失败可配置 OPENALEX_API_KEY 启用 OpenAlex 备用源。"}
+
+    papers, range_counts = filter_papers_by_time_range(all_papers, tr)
+    if not papers:
+        return {"error": f"已抓取 {len(all_papers)} 篇「{query}」相关论文，但时间范围"
+                         f"「{tr['label']}」内没有论文（{tr['basis']}）。"
+                         f"可以切换到更宽的时间范围，或调高检索论文数。"}
 
     if on_progress:
         on_progress(len(papers), len(papers), "正在构建合作网络...")
     G, total_authors, skipped = build_network(papers, min_papers)
 
     if G.number_of_nodes() == 0:
-        return {"error": f"这批论文涉及 {total_authors} 位作者，但没有人在该方向发过 "
-                         f"{min_papers} 篇以上。可以调低「最少发文数」，或调高检索论文数。"}
+        scope = "" if tr["years"] is None else f"在时间范围「{tr['label']}」内"
+        return {"error": f"这批论文{scope}涉及 {total_authors} 位作者，但没有人在该方向发过 "
+                         f"{min_papers} 篇以上。可以调低「最少发文数」，或调高检索论文数"
+                         + ("，或切换到更宽的时间范围。" if tr["years"] is not None else "。")}
 
     coverage = {
         "enrich_status": "skipped",
@@ -1021,8 +1178,8 @@ def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=T
             coverage["enrich_message"] = source_message
             coverage["enrich_status"] = "fallback"
     elif enrich:
-        enriched, coverage = enrich_from_openalex(papers, on_progress)
-        apply_enrichment(G, enriched)
+        coverage = dict(raw.get("enrich_coverage") or {})
+        apply_enrichment(G, aggregate_openalex_works(papers, raw.get("works_by_doi") or {}))
         if source_message:
             coverage["degraded"] = True
             coverage["enrich_message"] = (
@@ -1039,7 +1196,7 @@ def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=T
     with_cite = sum(1 for _, d in G.nodes(data=True) if d.get("citations"))
     payload["stats"] = {
         "query": query,
-        "papers_fetched": len(papers),
+        "papers_fetched": len(all_papers),
         "papers_available": total_available,
         "scholars": G.number_of_nodes(),
         "relations": G.number_of_edges(),
@@ -1057,12 +1214,34 @@ def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=T
         "data_source": source,
         "source_message": source_message,
         **coverage,
+        # 时间范围口径：界面条幅、短名单、CSV 都从这里取，保证一致
+        "time_range": tr,
+        "papers_in_range": range_counts["in_range"],
+        "papers_out_of_range": range_counts["out_of_range"],
+        "papers_no_year": range_counts["no_year"],
+        "papers_year_min": min((y for y in map(paper_year, papers) if y), default=None),
+        "papers_year_max": max((y for y in map(paper_year, papers) if y), default=None),
     }
     payload["error"] = None
     payload["_graph"] = G   # 供深度模式接着扩展，序列化给前端之前会被去掉
     # 非 dblp 源没有可靠的作者主页滚雪球接口，深度扩展会空转；交给 deep_expand 自行判断
     payload["_data_source"] = source
+    payload["_time_range"] = tr
     return payload
+
+
+def search_topic(query, max_papers=300, min_papers=2, on_progress=None, enrich=True,
+                 time_range=None):
+    """
+    完整流程：联网检索 -> 按时间范围过滤 -> 建图 -> 补充属性 -> 聚类 -> 输出前端可用的数据。
+    返回 dict，其中 error 非空表示这次检索没有可用结果。
+
+    主源是 dblp（含 Anubis PoW 自动通过）；若出口 IP 仍被硬拦或日配额耗尽，
+    自动降级到 OpenAlex / Crossref，并在 stats 里写明 data_source / source_message。
+    time_range: all / 5y / 3y（也接受 5 / 3），默认全部，口径见 resolve_time_range。
+    """
+    raw = fetch_topic_papers(query, max_papers, on_progress, enrich)
+    return build_topic_payload(raw, min_papers, time_range, on_progress)
 
 
 def deep_expand(fast_payload, seed_count=15, per_seed=15, on_progress=None):
@@ -1079,7 +1258,8 @@ def deep_expand(fast_payload, seed_count=15, per_seed=15, on_progress=None):
         return {"error": f"当前结果来自备用源「{source}」，深度扩展依赖 dblp 作者检索，已跳过。"
                          f"请待 dblp 恢复后重试深度模式。"}
 
-    S = snowball_expand(G, seed_count, per_seed, on_progress)
+    S = snowball_expand(G, seed_count, per_seed, on_progress,
+                        time_range=fast_payload.get("_time_range"))
 
     if on_progress:
         on_progress(seed_count, seed_count, "正在聚类研究团体...")

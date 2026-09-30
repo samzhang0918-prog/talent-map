@@ -4,6 +4,7 @@
 用法：
     python3 talent_map_by_topic.py "BEV perception"
     python3 talent_map_by_topic.py "occupancy prediction" --papers 2000 --min-papers 3
+    python3 talent_map_by_topic.py "lane detection" --years 3   # 只统计近 3 年（含当年）的论文
     python3 talent_map_by_topic.py --list          # 查看预置方向词表
 
 如果想要"在网页里输入关键词、实时出图"的交互式版本，用 app.py（Web 应用）。
@@ -288,6 +289,12 @@ def render(payload, topic, out_file):
     net.toggle_physics(True)
 
     s = payload["stats"]
+    tr = s.get("time_range") or {}
+    if tr.get("years"):
+        range_prefix = (f"时间范围 {tr['label']}（{tr['basis']}，范围内 "
+                        f"{s.get('papers_in_range')} 篇）· ")
+    else:
+        range_prefix = "时间范围 全部年份 · "
     if s.get("mode") == "deep":
         stats = (f"深度模式 · 检索 {s['papers_fetched']} / {s['papers_available']} 篇论文 · "
                  f"{s['seed_count']} 位方向核心学者 + 合作圈共 {s['scholars']} 人 · "
@@ -300,6 +307,7 @@ def render(payload, topic, out_file):
                  f"研究团体 {s['communities']} 个")
     if s.get("enriched"):
         stats += f" · 引用数 {s['with_citations']} 人 / 机构 {s['with_institution']} 人"
+    stats = range_prefix + stats
     html = inject_ui(net.generate_html(), legend, topic, stats)
 
     with open(out_file, "w", encoding="utf-8") as f:
@@ -329,6 +337,9 @@ def main():
                              "（每位种子约 14 秒，默认 10 位约 2~3 分钟）")
     parser.add_argument("--seeds", type=int, default=10,
                         help="深度模式的种子学者数量（默认 10）")
+    parser.add_argument("--years", default="all", choices=["all", "5", "3"],
+                        help="时间范围：all=全部（默认）/ 5=近 5 年 / 3=近 3 年；按论文发表年份、"
+                             "含当年，发文数/方向核心/合作边/引用都只统计范围内论文")
     parser.add_argument("--list", action="store_true", help="列出预置方向词表")
     args = parser.parse_args()
 
@@ -346,8 +357,10 @@ def main():
     def on_progress(fetched, total, message):
         print(f"  {message}")
 
-    print(f"正在 dblp 检索方向：{args.topic}")
-    payload = topic_graph.search_topic(args.topic, args.papers, args.min_papers, on_progress)
+    time_range = topic_graph.resolve_time_range(args.years)
+    print(f"正在 dblp 检索方向：{args.topic}（时间范围：{time_range['label']}）")
+    payload = topic_graph.search_topic(args.topic, args.papers, args.min_papers, on_progress,
+                                       time_range=time_range)
 
     if payload.get("error"):
         print(f"\n{payload['error']}")
@@ -362,7 +375,8 @@ def main():
         else:
             payload = deep_payload
 
-    out_file = f"talent_map_{safe_filename(args.topic)}.html"
+    suffix = "" if time_range["years"] is None else f"_{time_range['start']}-{time_range['end']}"
+    out_file = f"talent_map_{safe_filename(args.topic)}{suffix}.html"
     stats = render(payload, args.topic, out_file)
     print(f"\n[成功] {stats}")
     print(f"已生成 {out_file}，双击即可打开。")
