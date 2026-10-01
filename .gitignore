@@ -10,6 +10,7 @@
 !/app.py
 !/topic_graph.py
 !/talent_map_by_topic.py
+!/test_cache.py
 
 # vis-network 前端库（本地提供，避免 CDN 被网络环境挡住时页面整个空白）
 !/lib/

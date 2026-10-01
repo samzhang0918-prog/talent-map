@@ -20,7 +20,6 @@ OpenAlex 补充数据按「关键词 + 论文数」单独缓存，切换范围�
 import asyncio
 import json
 import threading
-import time
 
 import os
 
@@ -40,10 +39,36 @@ _LIB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
 if os.path.isdir(_LIB_DIR):
     app.mount("/lib", StaticFiles(directory=_LIB_DIR), name="lib")
 
-# key -> (存入时间, 结果)。进程内缓存，重启即失效，够用了。
-_CACHE = {}
+# 进程内缓存，重启即失效，够用了。按用途分三份，各自有容量上限（LRU 淘汰）+ 30 分钟 TTL：
+#   result：快速结果（关键词 + 论文数 + 最少发文 + 时间范围）
+#   raw   ：抓到的原始论文 + OpenAlex 补充（关键词 + 论文数），切换时间范围时复用；单条最大
+#           （papers=2000 时几 MB），所以上限最小
+#   deep  ：深度模式结果
+# 上限可用环境变量覆盖（正整数）：TALENT_MAP_RESULT_CACHE_MAX / TALENT_MAP_RAW_CACHE_MAX /
+# TALENT_MAP_DEEP_CACHE_MAX；dblp 响应缓存见 topic_graph（TALENT_MAP_DBLP_CACHE_MAX）。
 _CACHE_TTL = 30 * 60
-_CACHE_LOCK = threading.Lock()
+RESULT_CACHE_MAX = topic_graph.env_int("TALENT_MAP_RESULT_CACHE_MAX", 64)
+RAW_CACHE_MAX = topic_graph.env_int("TALENT_MAP_RAW_CACHE_MAX", 16)
+DEEP_CACHE_MAX = topic_graph.env_int("TALENT_MAP_DEEP_CACHE_MAX", 32)
+_RESULT_CACHE = topic_graph.TTLLRUCache(RESULT_CACHE_MAX, _CACHE_TTL, name="result")
+_RAW_CACHE = topic_graph.TTLLRUCache(RAW_CACHE_MAX, _CACHE_TTL, name="raw")
+_DEEP_CACHE = topic_graph.TTLLRUCache(DEEP_CACHE_MAX, _CACHE_TTL, name="deep")
+
+
+class _CacheGroup:
+    """只读汇总视图（keys / len），方便排障时一次看全部 key；读写直接用各自的缓存。"""
+
+    def __init__(self, *caches):
+        self.caches = caches
+
+    def keys(self):
+        return [k for c in self.caches for k in c.keys()]
+
+    def __len__(self):
+        return sum(len(c) for c in self.caches)
+
+
+_CACHE = _CacheGroup(_RESULT_CACHE, _RAW_CACHE, _DEEP_CACHE)
 
 # 公开部署时的参数上限，比 topic_graph 里 dblp 自身的技术上限（10000 篇 / 40 秒子）
 # 收紧很多——见 /api/search 里的注释。
@@ -75,19 +100,36 @@ def get_client_ip(request):
     return request.client.host if request.client else "unknown"
 
 
-def cache_get(key):
-    with _CACHE_LOCK:
-        hit = _CACHE.get(key)
-        if hit and time.time() - hit[0] < _CACHE_TTL:
-            return hit[1]
-        if hit:
-            del _CACHE[key]
-    return None
+def fast_cache_key(q, papers, min_papers, time_range):
+    # 时间范围写进 key；缓存跨自然年时 resolve_time_range 的起止年会变，
+    # 所以连同具体年份一起放进去，避免跨年后命中旧口径
+    range_sig = f"{time_range['key']}:{time_range['start']}-{time_range['end']}"
+    return f"{q}|{papers}|{min_papers}|{range_sig}"
 
 
-def cache_put(key, value):
-    with _CACHE_LOCK:
-        _CACHE[key] = (time.time(), value)
+def range_alternatives(raw, q, papers, min_papers, time_range):
+    """
+    当前时间范围没有结果时，用已缓存的原始数据（不再请求 dblp / OpenAlex）试算更宽的范围，
+    返回有结果的那些档位，供前端给出「切到近 5 年 / 切到全部」。
+    算出来的结果顺手放进结果缓存，用户点击后直接命中。
+    """
+    out = []
+    for key in topic_graph.wider_time_range_keys(time_range["key"]):
+        tr = topic_graph.resolve_time_range(key)
+        alt_key = fast_cache_key(q, papers, min_papers, tr)
+        res = _RESULT_CACHE.get(alt_key)
+        if res is None:
+            res = topic_graph.build_topic_payload(raw, min_papers, tr)
+            if res.get("error"):
+                continue
+            _RESULT_CACHE.put(alt_key, res)
+        out.append({
+            "key": tr["key"],
+            "value": str(tr["years"]) if tr["years"] else "all",   # 对应前端下拉框的 value
+            "label": tr["label"],
+            "scholars": res["stats"]["scholars"],
+        })
+    return out
 
 
 def strip_internal(payload):
@@ -123,7 +165,6 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
     min_papers = max(1, min(min_papers, 20))
     seeds = max(3, min(seeds, PUBLIC_MAX_SEEDS))
     time_range = topic_graph.resolve_time_range(years)
-    range_key = time_range["key"]
     client_ip = get_client_ip(request)
 
     async def event_stream():
@@ -156,27 +197,27 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
             # 否则会卡住整个事件循环，连已经产生的进度都推不出去。
             def worker():
                 try:
-                    # 时间范围写进 key；缓存跨自然年时 resolve_time_range 的起止年会变，
-                    # 所以连同具体年份一起放进去，避免跨年后命中旧口径
-                    range_sig = f"{range_key}:{time_range['start']}-{time_range['end']}"
-                    fast_key = f"{q}|{papers}|{min_papers}|{range_sig}"
-                    fast = cache_get(fast_key)
+                    fast_key = fast_cache_key(q, papers, min_papers, time_range)
+                    fast = _RESULT_CACHE.get(fast_key)
                     if fast is None:
                         # 原始论文 + OpenAlex 补充与时间范围无关，单独缓存：
                         # 同一关键词切换范围时不再打 dblp / OpenAlex，只在本地重算
                         raw_key = f"raw|{q}|{papers}"
-                        raw = cache_get(raw_key)
+                        raw = _RAW_CACHE.get(raw_key)
                         if raw is None:
                             raw = topic_graph.fetch_topic_papers(
                                 q, papers, make_reporter("progress"))
                             if raw.get("papers"):
-                                cache_put(raw_key, raw)
+                                _RAW_CACHE.put(raw_key, raw)
                         else:
                             make_reporter("progress")(0, 0, "已抓取过该关键词，按所选时间范围重新统计…")
                         fast = topic_graph.build_topic_payload(
                             raw, min_papers, time_range, make_reporter("progress"))
                         if not fast.get("error"):
-                            cache_put(fast_key, fast)
+                            _RESULT_CACHE.put(fast_key, fast)
+                        elif fast.get("error_kind") == "empty_range" and raw.get("papers"):
+                            fast["range_alternatives"] = range_alternatives(
+                                raw, q, papers, min_papers, time_range)
                     else:
                         make_reporter("progress")(0, 0, "命中缓存，直接返回")
 
@@ -185,13 +226,13 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
                         loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
                         return
 
-                    deep_key = f"{q}|{papers}|{min_papers}|{range_sig}|deep{seeds}"
-                    deep_res = cache_get(deep_key)
+                    deep_key = f"{fast_key}|deep{seeds}"
+                    deep_res = _DEEP_CACHE.get(deep_key)
                     if deep_res is None:
                         deep_res = topic_graph.deep_expand(
                             fast, seeds, on_progress=make_reporter("deep_progress"))
                         if not deep_res.get("error"):
-                            cache_put(deep_key, deep_res)
+                            _DEEP_CACHE.put(deep_key, deep_res)
                     loop.call_soon_threadsafe(queue.put_nowait, ("deep_result", deep_res))
                     loop.call_soon_threadsafe(queue.put_nowait, ("finish", None))
                 except Exception as exc:
@@ -211,7 +252,10 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
                     yield sse(kind, data)
                 elif kind == "fast_result":
                     if data.get("error"):
-                        yield sse("error", {"message": data["error"]})
+                        err = {"message": data["error"]}
+                        if data.get("range_alternatives"):
+                            err["range_alternatives"] = data["range_alternatives"]
+                        yield sse("error", err)
                     else:
                         yield sse("done", strip_internal(data))
                 elif kind == "deep_result":
@@ -440,6 +484,10 @@ PAGE = """<!DOCTYPE html>
   #relaxBox { margin-top: 14px; display: none; text-align: left; }
   #relaxBox h4 { margin: 0 0 8px; font-size: 13px; color: #cdd6f4; font-weight: 600; }
   #relaxChips { display: flex; flex-wrap: wrap; gap: 6px; }
+  #rangeAltBox, #restoreBox { margin-top: 14px; display: none; text-align: left; }
+  #rangeAltBox h4 { margin: 0 0 8px; font-size: 13px; color: #cdd6f4; font-weight: 600; }
+  #rangeAltChips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip.rangeAlt { border-color: #a6e3a1; color: #a6e3a1; }
   .bar { width: 300px; height: 4px; background: #313244; border-radius: 2px; margin: 14px auto 0; overflow: hidden; }
   .bar div { height: 100%; background: #89b4fa; width: 0; transition: width .3s; }
   .bar.hidden { display: none; }
@@ -553,6 +601,13 @@ PAGE = """<!DOCTYPE html>
         dblp 要求每次请求间隔 4 秒，检索 300 篇约需 10 秒。<br />
         默认快速检索；深度模式为可选项（默认关闭），会引入非该方向的合作者。
       </div>
+      <div id="rangeAltBox">
+        <h4>切换时间范围（用已抓取的数据重新统计，不重新检索）</h4>
+        <div id="rangeAltChips"></div>
+      </div>
+      <div id="restoreBox">
+        <button type="button" class="btnSecondary" id="restoreLastBtn">返回上次结果</button>
+      </div>
       <div id="relaxBox">
         <h4>可点选放宽关键词后重搜</h4>
         <div id="relaxChips"></div>
@@ -567,6 +622,7 @@ var network = null, nodesDS = null, edgesDS = null;
 var colorById = {}, sizeById = {}, labelById = {}, allNodes = [];
 var modified = [], activeCid = null, currentES = null, deepStart = null;
 var activeInst = null, lastStats = null, currentView = 'graph', lastQuery = '';
+var searchSeq = 0;   // 每次 runSearch 自增；旧检索的延时回调据此失效，不会盖掉新的提示
 var DIM = '#3a3a4a';
 
 var $ = function (id) { return document.getElementById(id); };
@@ -656,6 +712,10 @@ fetch('/api/presets').then(function (r) { return r.json(); }).then(function (d) 
 function setOverlay(show, opts) {
   opts = opts || {};
   $('overlay').classList.toggle('hidden', !show);
+  if (!show || opts.busy) {
+    $('rangeAltBox').style.display = 'none';
+    $('restoreBox').style.display = 'none';
+  }
   if (!show) { $('relaxBox').style.display = 'none'; return; }
   $('msg').textContent = opts.msg || '';
   $('sub').innerHTML = opts.sub || '';
@@ -707,10 +767,58 @@ function showRelaxSuggestions(q, msgText) {
   $('relaxBox').style.display = 'block';
 }
 
+// 某个时间范围没有结果时，后端用已缓存的原始数据试算更宽的档位，有结果的才给出来
+function showRangeAlternatives(q, alts) {
+  var box = $('rangeAltChips');
+  box.innerHTML = '';
+  if (!alts || !alts.length) { $('rangeAltBox').style.display = 'none'; return; }
+  alts.forEach(function (a) {
+    var c = document.createElement('span');
+    c.className = 'chip rangeAlt';
+    c.setAttribute('data-range', a.value);
+    c.textContent = (a.key === 'all' ? '切到全部' : '切到' + a.label) + ' · ' + a.scholars + ' 人';
+    c.title = '下拉框同步切换，并用已抓取的论文重新统计（不重新请求 dblp）';
+    c.onclick = function () {
+      $('rangeSelect').value = a.value;
+      $('topicInput').value = q;
+      runSearch();
+    };
+    box.appendChild(c);
+  });
+  $('rangeAltBox').style.display = 'block';
+}
+
+// 报错后仍保留上一次结果的入口（结构图 / 短名单 / 导出）
+function showRestoreEntry() {
+  if (!lastStats || !allNodes.length) { $('restoreBox').style.display = 'none'; return; }
+  $('restoreLastBtn').textContent = '返回上次结果（' + (lastStats.query || '') + ' · '
+    + currentRange().label + ' · ' + allNodes.length + ' 人）';
+  $('restoreBox').style.display = 'block';
+  $('viewToggle').style.display = 'flex';
+}
+
+function showResultChrome() {
+  renderScopeBar();
+  renderStatsBar();
+  $('viewToggle').style.display = 'flex';
+  setView(currentView);
+}
+
+function restoreLastResult() {
+  if (!lastStats || !allNodes.length) return;
+  // 头部控件回到「正在展示的结果」的口径，避免下拉框和图/短名单/CSV 不一致
+  var tr = currentRange();
+  $('rangeSelect').value = tr.years ? String(tr.years) : 'all';
+  if (lastStats.query) { $('topicInput').value = lastStats.query; lastQuery = lastStats.query; }
+  setOverlay(false);
+  showResultChrome();
+}
+
 function runSearch() {
   var q = $('topicInput').value.trim();
   if (!q) { $('topicInput').focus(); return; }
   if (currentES) currentES.close();
+  searchSeq += 1;
   lastQuery = q;
   closeDetail();
   setView('graph');
@@ -783,10 +891,16 @@ function runSearch() {
 
   es.addEventListener('error', function (e) {
     es.close(); currentES = null; $('goBtn').disabled = false;
-    var m = '检索失败';
-    try { m = JSON.parse(e.data).message; } catch (err) {}
+    var m = '检索失败', alts = [];
+    try {
+      var d = JSON.parse(e.data);
+      m = d.message || m;
+      alts = d.range_alternatives || [];
+    } catch (err) {}
     setOverlay(true, { busy: false, msg: '没有结果', sub: esc(m),
                        relaxQuery: q, message: m });
+    showRangeAlternatives(q, alts);
+    showRestoreEntry();
   });
 
   es.onerror = function () {
@@ -794,6 +908,7 @@ function runSearch() {
     es.close(); currentES = null; $('goBtn').disabled = false;
     setOverlay(true, { busy: false, msg: '连接中断',
                        sub: '与本地服务的连接断开了，确认 app.py 仍在运行后重试。' });
+    showRestoreEntry();
   };
 }
 
@@ -866,7 +981,31 @@ function render(data) {
   $('viewToggle').style.display = 'flex';
 
   renderScopeBar();
+  renderStatsBar();
   var s = data.stats || {};
+
+  // Few-result hint: still show the graph, but offer relaxation chips on overlay briefly? 
+  // Keep graph; if scholars are very few, surface suggestions under stats via overlay only on error.
+  // Soft hint when papers_available is tiny relative to query wordiness:
+  if (lastQuery && suggestQueries(lastQuery).length && s.papers_available != null && s.papers_available < 30) {
+    // non-blocking: user already has a graph; skip overlay
+  }
+
+  var mySeq = searchSeq;
+  network.once('stabilizationIterationsDone', function () {
+    if (mySeq !== searchSeq) return;
+    network.fit({ animation: false });
+    setOverlay(false);
+  });
+  setTimeout(function () {
+    if (mySeq !== searchSeq) return;   // 之后又发起了检索（可能已经在显示报错提示），别把它盖掉
+    if (network) network.fit({ animation: false });
+    setOverlay(false);
+  }, 6000);
+}
+
+function renderStatsBar() {
+  var s = lastStats || {};
   var txt;
   var tr0 = currentRange();
   var rangePrefix = tr0.years ? (tr0.label + ' · ') : '全部年份 · ';
@@ -901,22 +1040,6 @@ function render(data) {
   }
   $('stats').textContent = txt;
   $('stats').style.display = 'block';
-
-  // Few-result hint: still show the graph, but offer relaxation chips on overlay briefly? 
-  // Keep graph; if scholars are very few, surface suggestions under stats via overlay only on error.
-  // Soft hint when papers_available is tiny relative to query wordiness:
-  if (lastQuery && suggestQueries(lastQuery).length && s.papers_available != null && s.papers_available < 30) {
-    // non-blocking: user already has a graph; skip overlay
-  }
-
-  network.once('stabilizationIterationsDone', function () {
-    network.fit({ animation: false });
-    setOverlay(false);
-  });
-  setTimeout(function () {
-    if (network) network.fit({ animation: false });
-    setOverlay(false);
-  }, 6000);
 }
 
 function computeSizes() {
@@ -1266,48 +1389,80 @@ function renderShortlist() {
   body.appendChild(frag);
 }
 
-function exportCsv() {
-  var rows = filteredNodes().slice().sort(function (a, b) {
-    if (b.papers !== a.papers) return b.papers - a.papers;
-    return (b.citations || 0) - (a.citations || 0);
-  });
-  var disclaimer = [
-    '# 免责声明：本短名单仅供学术结构探索与试用筛选。',
-    '# 论文署名机构（发表当时）反映论文元数据中的署名单位，不等于现职担保。',
-    '# Google Scholar 列为作者搜索页 URL，非精确个人主页；同名需人工甄别。',
-    '# 方向相关引用/机构可能因 OpenAlex 配额用尽、接口失败或元数据缺口而缺失（留空，勿当作 0）。',
-    '# 查询词: ' + (lastQuery || ''),
-    '# 时间范围: ' + rangeFullText() + '；发文数、方向核心判定、合作关系、聚类、引用与排序均只统计该范围内论文'
-      + (currentRange().years ? '（引用 = 范围内论文至今的累计被引）' : ''),
-    '# 导出时间(本地): ' + new Date().toLocaleString()
-  ];
-  var header = ['姓名', '论文署名机构（发表当时）', '方向发文数', '方向相关引用',
-                '角色标签', '团体/聚类ID', 'Scholar搜索URL', '数据置信/缺口标记', '时间范围'];
-  function csvCell(v) {
-    var s = String(v == null ? '' : v);
-    if (/[",\\n\\r]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
-    return s;
-  }
-  var lines = disclaimer.concat([header.map(csvCell).join(',')]);
+// 导出时间：固定格式的 ISO 8601（本地时间 + 时区偏移），如 2026-10-01T13:25:00+08:00。
+// 不用 toLocaleString：它随浏览器语言变化，英文环境会带逗号，导致 Excel 错列。
+function isoLocalTimestamp(d) {
+  d = d || new Date();
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  var off = -d.getTimezoneOffset();
+  var sign = off >= 0 ? '+' : '-';
+  off = Math.abs(off);
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
+    + sign + pad(Math.floor(off / 60)) + ':' + pad(off % 60);
+}
+
+// RFC 4180：含逗号、双引号、CR、LF 的字段整体加双引号，内部双引号写成两个
+function csvCell(v) {
+  var s = String(v == null ? '' : v);
+  if (/[",\\r\\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+var CSV_HEADER = ['姓名', '论文署名机构（发表当时）', '方向发文数', '方向相关引用',
+                  '角色标签', '团体/聚类ID', 'Scholar搜索URL', '数据置信/缺口标记',
+                  '时间范围', '查询词', '导出时间', '免责声明'];
+
+function csvDisclaimer() {
+  var tr = currentRange();
+  return '本短名单仅供学术结构探索与试用筛选；'
+    + '论文署名机构（发表当时）反映论文元数据中的署名单位，不等于现职担保；'
+    + 'Google Scholar 列为作者搜索页 URL，非精确个人主页，同名需人工甄别；'
+    + '方向相关引用/机构可能因 OpenAlex 配额用尽、接口失败或元数据缺口而缺失（留空，勿当作 0）；'
+    + '时间范围口径：' + (tr.years ? tr.basis : '全部年份，不按年份过滤')
+    + '，发文数、方向核心判定、合作关系、聚类、引用与排序均只统计该范围内论文'
+    + (tr.years ? '（引用 = 范围内论文至今的累计被引）' : '');
+}
+
+// 第一行就是表头（没有注释行、没有尾部说明），pandas.read_csv / Excel 都能直接读；
+// 查询词、时间范围、导出时间、免责声明作为独立列每行重复。
+function buildCsv(rows, exportedAt) {
+  var query = (lastStats && lastStats.query) || lastQuery || '';
+  var rangeLabel = currentRange().label;
+  var disclaimer = csvDisclaimer();
+  var lines = [CSV_HEADER.map(csvCell).join(',')];
   rows.forEach(function (n) {
     lines.push([
       n.label,
       n.institution || '',
       n.is_seed === false ? '' : n.papers,
-      citationDisplay(n),
+      citationDisplay(n),          // 缺失留空，不填 0
       roleLabel(n),
       n.community,
       scholarSearchUrl(n),
       gapMarkers(n).join('; '),
-      currentRange().label
+      rangeLabel,
+      query,
+      exportedAt,
+      disclaimer
     ].map(csvCell).join(','));
   });
+  return lines.join('\\r\\n') + '\\r\\n';
+}
+
+function exportCsv() {
+  var rows = filteredNodes().slice().sort(function (a, b) {
+    if (b.papers !== a.papers) return b.papers - a.papers;
+    return (b.citations || 0) - (a.citations || 0);
+  });
+  var text = buildCsv(rows, isoLocalTimestamp(new Date()));
   // UTF-8 BOM so Excel on Windows opens Chinese correctly
-  var blob = new Blob(['\\ufeff' + lines.join('\\n')], { type: 'text/csv;charset=utf-8' });
+  var blob = new Blob(['\\ufeff' + text], { type: 'text/csv;charset=utf-8' });
   var a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   var tr = currentRange();
-  a.download = 'talent-shortlist-' + (lastQuery || 'export').replace(/ +/g, '_')
+  var query = (lastStats && lastStats.query) || lastQuery || 'export';
+  a.download = 'talent-shortlist-' + query.replace(/ +/g, '_')
     + '-' + (tr.years ? (tr.start + '-' + tr.end) : 'all-years') + '.csv';
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
@@ -1328,8 +1483,11 @@ $('resetBtn').onclick = function () {
 $('goBtn').onclick = runSearch;
 $('topicInput').addEventListener('keydown', function (e) { if (e.key === 'Enter') runSearch(); });
 $('detailClose').onclick = closeDetail;
-$('viewGraphBtn').onclick = function () { setView('graph'); };
-$('viewListBtn').onclick = function () { setView('list'); };
+// 报错提示还盖着时点「结构图 / 短名单」，先恢复上一次结果再切视图
+function overlayBlocking() { return !$('overlay').classList.contains('hidden') && !currentES; }
+$('viewGraphBtn').onclick = function () { if (overlayBlocking()) restoreLastResult(); setView('graph'); };
+$('viewListBtn').onclick = function () { if (overlayBlocking()) restoreLastResult(); setView('list'); };
+$('restoreLastBtn').onclick = restoreLastResult;
 $('listNameFilter').addEventListener('input', function () { renderShortlist(); });
 $('listMinPapers').addEventListener('input', function () { renderShortlist(); });
 $('listClusterFilter').onchange = function () { renderShortlist(); };

@@ -26,7 +26,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from urllib.parse import urlparse
 
 import networkx as nx
@@ -83,13 +83,99 @@ SESSION.headers.update({
 _DBLP_GATE = threading.Lock()
 _DBLP_LAST = 0.0
 
+
+
+def env_int(name, default, minimum=1):
+    """读整数环境变量；未设置、非整数或小于 minimum 时用默认值。"""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        print(f"[config] 环境变量 {name}={raw!r} 不是整数，改用默认值 {default}", flush=True)
+        return default
+    if value < minimum:
+        print(f"[config] 环境变量 {name}={value} 小于 {minimum}，改用默认值 {default}", flush=True)
+        return default
+    return value
+
+
+class TTLLRUCache:
+    """
+    进程内缓存：TTL（自写入起计时，读取不续期）+ 容量上限（LRU 淘汰）。
+
+    公开部署长期运行时，每个新关键词都会往缓存里加东西；只有 TTL 没有容量上限的话，
+    30 分钟内被大量不同关键词打满就会一直涨内存。这里写入时先清掉过期项，
+    再按最近最少使用淘汰到 maxsize 以内。
+
+    线程安全：检索在后台线程里跑（app.py 的 worker），所有操作都在同一把锁里完成。
+    """
+
+    def __init__(self, maxsize, ttl, name="cache", clock=time.monotonic):
+        self.maxsize = max(1, int(maxsize))
+        self.ttl = float(ttl)
+        self.name = name
+        self._clock = clock
+        self._data = OrderedDict()   # key -> (写入时刻, value)；末尾 = 最近使用
+        self._lock = threading.Lock()
+        self.evictions = 0           # 因容量上限被淘汰的条数（不含过期清理），便于观测/测试
+        self.expirations = 0
+
+    def _expired(self, ts, now):
+        return now - ts >= self.ttl
+
+    def get(self, key, default=None):
+        now = self._clock()
+        with self._lock:
+            hit = self._data.get(key)
+            if hit is None:
+                return default
+            if self._expired(hit[0], now):
+                del self._data[key]
+                self.expirations += 1
+                return default
+            self._data.move_to_end(key)
+            return hit[1]
+
+    def put(self, key, value):
+        now = self._clock()
+        with self._lock:
+            # 顺便清理过期项（条目数受 maxsize 限制，线性扫一遍开销可以忽略）
+            for k in [k for k, (ts, _) in self._data.items() if self._expired(ts, now)]:
+                del self._data[k]
+                self.expirations += 1
+            self._data[key] = (now, value)
+            self._data.move_to_end(key)
+            while len(self._data) > self.maxsize:
+                self._data.popitem(last=False)
+                self.evictions += 1
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+    def keys(self):
+        with self._lock:
+            return list(self._data.keys())
+
+    def __len__(self):
+        with self._lock:
+            return len(self._data)
+
+    def __contains__(self, key):
+        # 只查询、不刷新最近使用顺序
+        now = self._clock()
+        with self._lock:
+            hit = self._data.get(key)
+            return hit is not None and not self._expired(hit[0], now)
+
 # 成功 JSON 页缓存：同样的 q/offset 在短时间内重复搜索时不必再打 dblp。
-_DBLP_RESP_CACHE = {}
+# 滚雪球（深度模式）的作者检索也走这份缓存，切换时间范围重跑深度模式时可复用。
+# 每条是一页 ≤100 条的 dblp JSON，内存开销很小。
 _DBLP_RESP_CACHE_TTL = 20 * 60
-_DBLP_RESP_CACHE_LOCK = threading.Lock()
-# 滚雪球（深度模式）的作者检索也走这份缓存，切换时间范围重跑深度模式时可复用，
-# 所以比只缓存翻页时放大一些。每条是一页 ≤100 条的 dblp JSON，内存开销很小。
-_DBLP_RESP_CACHE_MAX = 128
+_DBLP_RESP_CACHE_MAX = env_int("TALENT_MAP_DBLP_CACHE_MAX", 128)
+_DBLP_RESP_CACHE = TTLLRUCache(_DBLP_RESP_CACHE_MAX, _DBLP_RESP_CACHE_TTL, name="dblp")
 
 # Anubis（Techaro）保护：dblp 对疑似自动化流量返回 PoW 挑战页，浏览器解完后
 # 拿 auth cookie。这是站点正常的 soft challenge，用同样的 HTTP 客户端完成即可。
@@ -101,25 +187,11 @@ _ANUBIS_AUTHED = False
 
 
 def _dblp_cache_get(url):
-    now = time.time()
-    with _DBLP_RESP_CACHE_LOCK:
-        hit = _DBLP_RESP_CACHE.get(url)
-        if not hit:
-            return None
-        ts, payload = hit
-        if now - ts > _DBLP_RESP_CACHE_TTL:
-            del _DBLP_RESP_CACHE[url]
-            return None
-        return payload
+    return _DBLP_RESP_CACHE.get(url)
 
 
 def _dblp_cache_put(url, payload):
-    with _DBLP_RESP_CACHE_LOCK:
-        if len(_DBLP_RESP_CACHE) >= _DBLP_RESP_CACHE_MAX:
-            # 丢掉最旧的一条
-            oldest = min(_DBLP_RESP_CACHE.items(), key=lambda kv: kv[1][0])[0]
-            del _DBLP_RESP_CACHE[oldest]
-        _DBLP_RESP_CACHE[url] = (time.time(), payload)
+    _DBLP_RESP_CACHE.put(url, payload)
 
 
 def _anubis_meets(digest: bytes, difficulty: int) -> bool:
@@ -355,6 +427,13 @@ def normalize_time_range(value):
     if not v.endswith("y"):
         v += "y"
     return v if v in TIME_RANGE_CHOICES else "all"
+
+
+def wider_time_range_keys(value):
+    """比当前更宽的时间范围（由近到远），用于空结果时给出「一键切回」：3y → [5y, all]。"""
+    key = normalize_time_range(value)
+    order = ["3y", "5y", "all"]
+    return order[order.index(key) + 1:] if key in order else []
 
 
 def resolve_time_range(value, current_year=None):
@@ -1153,7 +1232,9 @@ def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
     if not papers:
         return {"error": f"已抓取 {len(all_papers)} 篇「{query}」相关论文，但时间范围"
                          f"「{tr['label']}」内没有论文（{tr['basis']}）。"
-                         f"可以切换到更宽的时间范围，或调高检索论文数。"}
+                         f"可以切换到更宽的时间范围，或调高检索论文数。",
+                # 让上层知道这是时间范围导致的空结果，可以提供「切到更宽范围」
+                "error_kind": "empty_range"}
 
     if on_progress:
         on_progress(len(papers), len(papers), "正在构建合作网络...")
@@ -1163,7 +1244,8 @@ def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
         scope = "" if tr["years"] is None else f"在时间范围「{tr['label']}」内"
         return {"error": f"这批论文{scope}涉及 {total_authors} 位作者，但没有人在该方向发过 "
                          f"{min_papers} 篇以上。可以调低「最少发文数」，或调高检索论文数"
-                         + ("，或切换到更宽的时间范围。" if tr["years"] is not None else "。")}
+                         + ("，或切换到更宽的时间范围。" if tr["years"] is not None else "。"),
+                "error_kind": "empty_range" if tr["years"] is not None else "below_threshold"}
 
     coverage = {
         "enrich_status": "skipped",
