@@ -20,6 +20,7 @@ import colorsys
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -585,22 +586,47 @@ def openalex_work_to_paper(work):
     }
 
 
+# 被引数的合理上限：超过按缺失处理（防御脏数据 / 溢出，真实论文远到不了这个量级）
+CITATION_MAX = 10 ** 9
+# 字符串形式的被引数最多 12 位（避免超长数字串触发 int 位数上限）
+_CITATION_STR_MAXLEN = 12
+
+
 def citation_count_or_none(value):
     """
-    数据源给的被引数 -> int；拿不到就返回 None（按「缺失」处理，不当 0）。
-    口径：只有字段存在、且是非负整数（或纯数字字符串）时才算「取到了」，
-    所以字段明确为 0（如 Crossref is-referenced-by-count: 0）是真实 0；
-    字段缺失 / null / 非数字 / 负数 / 布尔值都算没取到。
+    数据源给的被引数 -> int；拿不到或不可信就返回 None（按「缺失」处理，不当 0）。
+    所有解析被引数的地方（Crossref is-referenced-by-count、OpenAlex 备用源 / OpenAlex 补充的
+    cited_by_count，以及备用源记录在本地聚合时）都只走这个函数，任何输入都不会抛异常。
+
+    口径：
+      bool                     -> 缺失
+      int                      -> 0 <= v <= CITATION_MAX 才算有数据
+      float                    -> 必须有限（math.isfinite）、整数值、0 <= v <= CITATION_MAX，
+                                  如 5.0 记为 5；inf / -inf / nan（JSON 的 1e400、Infinity、NaN）、5.5 -> 缺失
+      str                      -> strip 后必须 isascii() 且 isdecimal()、长度 <= 12，
+                                  转换后同样受上限约束；" 5 " / "5" / "0" 有数据，"²"、"٥"、超长串 -> 缺失
+      None / 其他类型 / 任何异常 -> 缺失
+    字段明确为 0（如 Crossref is-referenced-by-count: 0）是真实 0。
     """
-    if value is None or isinstance(value, bool):
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            v = value
+        elif isinstance(value, float):
+            if not math.isfinite(value) or not value.is_integer():
+                return None
+            v = int(value)
+        elif isinstance(value, str):
+            t = value.strip()
+            if not (t and len(t) <= _CITATION_STR_MAXLEN and t.isascii() and t.isdecimal()):
+                return None
+            v = int(t)
+        else:
+            return None
+        return v if 0 <= v <= CITATION_MAX else None
+    except (ValueError, OverflowError, TypeError):
         return None
-    if isinstance(value, int):
-        return value if value >= 0 else None
-    if isinstance(value, float):
-        return int(value) if value >= 0 and value == int(value) else None
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
 
 
 def crossref_work_to_paper(work):
@@ -989,8 +1015,11 @@ def aggregate_openalex_works(papers, works_by_doi):
         for dblp_paper in by_doi[doi]:
             for pid, name in parse_authors(dblp_paper):
                 rec = enriched[pid]
-                if work["citations"] is not None:
-                    rec["citations"] += work["citations"]
+                # works_by_doi 抓取时已经过 citation_count_or_none；聚合时再过一遍，
+                # 缓存或外部构造的数据里有 inf / 非法值也不会漏进总和
+                wc = citation_count_or_none(work.get("citations"))
+                if wc is not None:
+                    rec["citations"] += wc
                 for t in work["topics"]:
                     rec["topics"][t] += 1
                 insts = work["oa_authors"].get(normalize_person(name))
@@ -1002,7 +1031,8 @@ def aggregate_openalex_works(papers, works_by_doi):
     # 命中且 cited_by_count=0 算取到、值为 0。
     for p in papers:
         doi = (p.get("info", {}).get("doi") or "").lower()
-        hit = bool(doi and any(w.get("citations") is not None for w in works_by_doi.get(doi) or ()))
+        hit = bool(doi and any(citation_count_or_none(w.get("citations")) is not None
+                               for w in works_by_doi.get(doi) or ()))
         for pid, _ in parse_authors(p):
             rec = enriched[pid]
             rec["cite_total"] += 1
