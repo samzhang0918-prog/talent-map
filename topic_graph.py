@@ -578,10 +578,29 @@ def openalex_work_to_paper(work):
             "authors": {"author": authors},
         },
         "_source": "openalex",
-        "_citations": int(work.get("cited_by_count") or 0),
+        # 字段缺失时为 None（缺失），不当 0；见 citation_count_or_none
+        "_citations": citation_count_or_none(work.get("cited_by_count")),
         "_topics": topics,
         "_author_meta": inline,
     }
+
+
+def citation_count_or_none(value):
+    """
+    数据源给的被引数 -> int；拿不到就返回 None（按「缺失」处理，不当 0）。
+    口径：只有字段存在、且是非负整数（或纯数字字符串）时才算「取到了」，
+    所以字段明确为 0（如 Crossref is-referenced-by-count: 0）是真实 0；
+    字段缺失 / null / 非数字 / 负数 / 布尔值都算没取到。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value == int(value) else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
 
 def crossref_work_to_paper(work):
@@ -617,7 +636,9 @@ def crossref_work_to_paper(work):
             "authors": {"author": authors},
         },
         "_source": "crossref",
-        "_citations": int(work.get("is-referenced-by-count") or 0),
+        # Crossref 的被引数字段；不是每条记录都有，缺失时为 None（按缺失处理），
+        # 只有字段存在且为 0 才是真实 0
+        "_citations": citation_count_or_none(work.get("is-referenced-by-count")),
         "_topics": [],
         "_author_meta": {},
     }
@@ -634,15 +655,18 @@ def apply_inline_paper_meta(G, papers):
     """把 fallback 源自带的引用/机构/主题写进图（无需再打 OpenAlex enrich）。"""
     per_pid = defaultdict(_new_enrich_rec)
     for paper in papers:
-        cites = int(paper.get("_citations") or 0)
+        # 备用源记录自带的被引数（OpenAlex cited_by_count / Crossref is-referenced-by-count）；
+        # None = 该记录没有这个字段，只计入 cite_total、不计 cite_matched，
+        # 由 apply_enrichment 归为「部分缺失（≥N）」或「未补全」，不会被当成真实 0
+        cites = citation_count_or_none(paper.get("_citations"))
         topics = paper.get("_topics") or []
         meta = paper.get("_author_meta") or {}
         for pid, name in parse_authors(paper):
             rec = per_pid[pid]
-            rec["citations"] += cites
-            # 备用源的记录自带被引数（OpenAlex cited_by_count / Crossref is-referenced-by-count）
             rec["cite_total"] += 1
-            rec["cite_matched"] += 1
+            if cites is not None:
+                rec["citations"] += cites
+                rec["cite_matched"] += 1
             for t in topics:
                 rec["topics"][t] += 1
             for inst in (meta.get(pid) or {}).get("institutions") or []:
@@ -654,6 +678,9 @@ def apply_inline_paper_meta(G, papers):
         "degraded": False,
         "papers_with_doi": sum(1 for p in papers if p.get("info", {}).get("doi")),
         "papers_matched": len(papers),
+        # 记录里带被引数字段的篇数（Crossref 不是每条都有 is-referenced-by-count）
+        "papers_with_citations": sum(1 for p in papers
+                                     if citation_count_or_none(p.get("_citations")) is not None),
     }
 
 
@@ -905,7 +932,7 @@ def fetch_openalex_works(papers, on_progress=None):
             seq += 1
             works_by_doi[doi].append({
                 "seq": seq,
-                "citations": work.get("cited_by_count") or 0,
+                "citations": citation_count_or_none(work.get("cited_by_count")),
                 "topics": [t["display_name"] for t in (work.get("topics") or [])[:3]],
                 "oa_authors": oa_authors,
             })
@@ -962,7 +989,8 @@ def aggregate_openalex_works(papers, works_by_doi):
         for dblp_paper in by_doi[doi]:
             for pid, name in parse_authors(dblp_paper):
                 rec = enriched[pid]
-                rec["citations"] += work["citations"]
+                if work["citations"] is not None:
+                    rec["citations"] += work["citations"]
                 for t in work["topics"]:
                     rec["topics"][t] += 1
                 insts = work["oa_authors"].get(normalize_person(name))
@@ -970,10 +998,11 @@ def aggregate_openalex_works(papers, works_by_doi):
                     for inst in insts:
                         rec["institutions"][inst] += 1
     # 引用覆盖：每位作者在这批论文里有几篇取到了 OpenAlex 记录。没 DOI、OpenAlex 没命中、
-    # 所在批次失败（429 等）的论文都算「没取到」；命中但 cited_by_count=0 算取到、值为 0。
+    # 所在批次失败（429 等）、命中但记录里没有 cited_by_count 的论文都算「没取到」；
+    # 命中且 cited_by_count=0 算取到、值为 0。
     for p in papers:
         doi = (p.get("info", {}).get("doi") or "").lower()
-        hit = bool(doi and works_by_doi.get(doi))
+        hit = bool(doi and any(w.get("citations") is not None for w in works_by_doi.get(doi) or ()))
         for pid, _ in parse_authors(p):
             rec = enriched[pid]
             rec["cite_total"] += 1

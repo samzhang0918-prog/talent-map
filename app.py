@@ -177,7 +177,9 @@ async def search(request: Request, q: str, papers: int = 300, min_papers: int = 
         # 一个人开几个标签页会把队列占满，让其他访客等更久。
         with _INFLIGHT_LOCK:
             if client_ip in _INFLIGHT_IPS:
-                yield sse("error", {"message": "你有一个检索还在进行中，请等它结束后再发起新的搜索"})
+                # error_kind=busy：前端据此留在上次结果页，把提示放进提示区（不是「没有结果」）
+                yield sse("error", {"message": "你有一个检索还在进行中，请等它结束后再发起新的搜索",
+                                    "error_kind": "busy"})
                 return
             _INFLIGHT_IPS.add(client_ip)
 
@@ -359,20 +361,25 @@ PAGE = """<!DOCTYPE html>
               cursor: pointer; font-size: 12px; }
   .instItem:hover { background: #313244; }
   .instItem.active { background: #45475a; }
-  #deepBanner {
-    position: absolute; left: 50%; transform: translateX(-50%);
-    padding: 7px 16px; border-radius: 18px; font-size: 12px; z-index: 6; display: none;
-    max-width: min(720px, 90vw); text-align: center;
-    top: 16px;
-    background: rgba(137,180,250,.14); border: 1px solid #89b4fa; color: #cdd6f4;
+  /* 统一提示区：页面上所有提示条（数据源/补充降级、深度进行中/失败、限流、连接中断）
+     都是 #noticeArea 里的一行，放在文档流里（范围条下方、结构图与短名单上方），
+     多条按固定顺序往下堆叠，<main> 相应变矮——任何组合都不会浮在工具栏、标签页或查找框上。
+     不要给 .notice 加 position:absolute/fixed。 */
+  #noticeArea { position: static; }
+  #noticeArea .notice {
+    display: none; position: static; padding: 6px 22px; font-size: 12px; line-height: 1.5;
+    border-bottom: 1px solid; word-break: break-word;
   }
-  /* 降级 / 备用源提示放在文档流里（范围条下方、结构图与短名单上方），占自己的一行；
-     不再用覆盖层浮在短名单工具栏上，挡住「导出 CSV」和筛选项 */
-  #degradeBanner {
-    display: none; padding: 6px 22px; font-size: 12px; line-height: 1.5;
-    background: rgba(249,226,175,.10); border-bottom: 1px solid rgba(249,226,175,.45);
-    color: #f9e2af; word-break: break-word;
+  .notice.warn { background: rgba(249,226,175,.10); border-color: rgba(249,226,175,.45); color: #f9e2af; }
+  .notice.info { background: rgba(137,180,250,.10); border-color: rgba(137,180,250,.45); color: #cdd6f4; }
+  .notice.error { background: rgba(243,139,168,.10); border-color: rgba(243,139,168,.50); color: #f38ba8; }
+  #noticeArea .noticeClose {
+    float: right; margin: 0 0 0 12px; padding: 0 6px; background: none; border: none;
+    color: inherit; font-size: 15px; line-height: 18px; font-weight: 400; opacity: .75;
   }
+  #noticeArea .noticeClose:hover { opacity: 1; }
+  #noticeArea .noticeClose::before { content: "×"; }
+  #noticeArea .noticeClose[hidden] { display: none; }
   #presets { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
   .chip {
     padding: 4px 11px; font-size: 12px; background: #313244; border: 1px solid #45475a;
@@ -535,7 +542,13 @@ PAGE = """<!DOCTYPE html>
   <div id="presets"></div>
 </header>
 <div id="scopeBar"></div>
-<div id="degradeBanner" role="status"></div>
+<div id="noticeArea" aria-live="polite">
+  <!-- 顺序即堆叠顺序：数据源/补充降级 → 深度进行中/失败 → 限流 → 连接中断 -->
+    <div class="notice warn" id="degradeBanner" role="status"><button type="button" class="noticeClose" aria-label="关闭提示" title="关闭这条提示（不影响数据；新的检索会重新显示）" hidden></button><span class="noticeText"></span></div>
+    <div class="notice info" id="deepBanner" role="status"><button type="button" class="noticeClose" aria-label="关闭提示" title="关闭这条提示（不影响数据；新的检索会重新显示）" hidden></button><span class="noticeText"></span></div>
+    <div class="notice warn" id="rateBanner" role="status"><button type="button" class="noticeClose" aria-label="关闭提示" title="关闭这条提示（不影响数据；新的检索会重新显示）" hidden></button><span class="noticeText"></span></div>
+    <div class="notice error" id="connBanner" role="status"><button type="button" class="noticeClose" aria-label="关闭提示" title="关闭这条提示（不影响数据；新的检索会重新显示）" hidden></button><span class="noticeText"></span></div>
+</div>
 
 <main>
   <div id="graph"></div>
@@ -592,7 +605,6 @@ PAGE = """<!DOCTYPE html>
     <div id="detailBody"></div>
   </div>
   <div id="stats"></div>
-  <div id="deepBanner"></div>
   <div id="overlay">
     <div class="box">
       <div class="spinner hidden" id="spinner"></div>
@@ -669,7 +681,7 @@ function citationText(n) {
 
 function citationNote(n) {
   var st = citeStatus(n);
-  if (st === 'missing') return '未取到引用数据（论文缺 DOI、OpenAlex 未命中或补充降级），不代表 0 次';
+  if (st === 'missing') return '未取到引用数据（论文缺 DOI、OpenAlex 未命中、补充降级或备用源未提供被引数），不代表 0 次';
   if (st === 'partial') return '部分缺失：仅 ' + citePapers(n) + ' 篇论文取到引用数据，数值为已取到部分之和（下限）';
   return '';
 }
@@ -696,7 +708,7 @@ function gapMarkers(n) {
   var gaps = [];
   var cst = citeStatus(n);
   if (cst === 'missing') gaps.push('缺引用');
-  else if (cst === 'partial') gaps.push('引用部分缺失(' + citePapers(n) + '篇有数据)');
+  else if (cst === 'partial') gaps.push('引用部分缺失(' + citePapers(n) + '篇有数据)，数值为下限');
   if (!n.institution) gaps.push('缺署名机构');
   if (n.is_seed === false) gaps.push('非方向发文引入');
   return gaps;
@@ -754,6 +766,38 @@ fetch('/api/presets').then(function (r) { return r.json(); }).then(function (d) 
     c.onclick = function () { $('topicInput').value = t; runSearch(); };
     box.appendChild(c);
   });
+});
+
+// ---- 统一提示区 API：所有提示条只通过这里显示/隐藏 ----
+// level: info（进行中）/ warn（降级、限流）/ error（失败、中断）；dismissible: 显示关闭按钮。
+// 关闭只是隐藏这一条（同样的文字本次结果内不再弹出），不影响数据，新检索会清空重来。
+var NOTICE_IDS = ['degradeBanner', 'deepBanner', 'rateBanner', 'connBanner'];
+var noticeDismissed = {};
+function setNotice(id, text, opts) {
+  opts = opts || {};
+  var el = $(id);
+  if (!el) return;
+  if (!text) { clearNotice(id); return; }
+  if (opts.dismissible && noticeDismissed[id] === text) return;
+  el.className = 'notice ' + (opts.level || 'warn');
+  el.querySelector('.noticeText').textContent = text;
+  el.querySelector('.noticeClose').hidden = !opts.dismissible;
+  el.style.display = 'block';
+}
+function clearNotice(id) {
+  var el = $(id);
+  if (el) el.style.display = 'none';
+}
+function clearAllNotices() {
+  NOTICE_IDS.forEach(clearNotice);
+  noticeDismissed = {};
+}
+NOTICE_IDS.forEach(function (id) {
+  var el = $(id);
+  el.querySelector('.noticeClose').onclick = function () {
+    noticeDismissed[id] = el.querySelector('.noticeText').textContent;
+    clearNotice(id);
+  };
 });
 
 function setOverlay(show, opts) {
@@ -875,14 +919,14 @@ function runSearch() {
   $('searchPanel').style.display = 'none';
   $('stats').style.display = 'none';
   $('viewToggle').style.display = 'none';
-  $('degradeBanner').style.display = 'none';
+  clearAllNotices();
   $('scopeBar').style.display = 'none';
   $('listView').classList.remove('visible');
   setOverlay(true, { busy: true, msg: '正在检索「' + q + '」...',
                      sub: '正在联网查询论文库（dblp，必要时自动备用源）', progress: true, percent: 0 });
 
   var deep = $('deepInput').checked;
-  $('deepBanner').style.display = 'none';
+  var fastShown = false;   // 本次检索的快速结果是否已经展示（决定报错走提示区还是覆盖层）
   var url = '/api/search?q=' + encodeURIComponent(q)
           + '&papers=' + encodeURIComponent($('papersInput').value)
           + '&min_papers=' + encodeURIComponent($('minInput').value)
@@ -900,10 +944,10 @@ function runSearch() {
 
   es.addEventListener('done', function (e) {
     render(JSON.parse(e.data));
+    fastShown = true;
     if (deep) {
       deepStart = Date.now();
-      $('deepBanner').style.display = 'block';
-      $('deepBanner').textContent = '深度模式：正在扩展合作网络，完成后自动更新（可先浏览当前结果）';
+      setNotice('deepBanner', '深度模式：正在扩展合作网络，完成后自动更新（可先浏览当前结果）', { level: 'info' });
     } else {
       es.close(); currentES = null; $('goBtn').disabled = false;
     }
@@ -919,31 +963,40 @@ function runSearch() {
         ? '，预计还需 ' + Math.ceil(leftSec / 60) + ' 分钟'
         : '，预计还需 ' + leftSec + ' 秒';
     }
-    $('deepBanner').style.display = 'block';
-    $('deepBanner').textContent = '深度模式：' + d.message + extra;
+    setNotice('deepBanner', '深度模式：' + d.message + extra, { level: 'info' });
   });
 
   es.addEventListener('deep_done', function (e) {
     es.close(); currentES = null; $('goBtn').disabled = false;
     render(JSON.parse(e.data));
-    $('deepBanner').style.display = 'none';
+    clearNotice('deepBanner');
   });
 
   es.addEventListener('deep_error', function (e) {
     es.close(); currentES = null; $('goBtn').disabled = false;
     var m = '扩展失败';
     try { m = JSON.parse(e.data).message; } catch (err) {}
-    $('deepBanner').textContent = '深度扩展失败：' + m + '（快速结果仍可用）';
+    setNotice('deepBanner', '深度扩展失败：' + m + '（快速结果仍可用）', { level: 'error', dismissible: true });
   });
 
   es.addEventListener('error', function (e) {
+    // 只处理服务端主动推送的 error 事件（带 data）；连接断开时浏览器派发的是不带 data 的
+    // 普通 error 事件，交给下面的 es.onerror，否则会被误显示成「没有结果」并整页覆盖
+    if (!e || typeof e.data !== 'string') return;
     es.close(); currentES = null; $('goBtn').disabled = false;
-    var m = '检索失败', alts = [];
+    var m = '检索失败', alts = [], kind = '';
     try {
       var d = JSON.parse(e.data);
       m = d.message || m;
       alts = d.range_alternatives || [];
+      kind = d.error_kind || '';
     } catch (err) {}
+    // 限流（同一访客已有检索在进行）不是「没有结果」：有上次结果就留在结果页，提示放进提示区
+    if (kind === 'busy' && allNodes.length && lastStats) {
+      restoreLastResult();
+      setNotice('rateBanner', m + '（「' + q + '」未发起，当前仍显示上次结果）', { level: 'warn', dismissible: true });
+      return;
+    }
     setOverlay(true, { busy: false, msg: '没有结果', sub: esc(m),
                        relaxQuery: q, message: m });
     showRangeAlternatives(q, alts);
@@ -953,6 +1006,13 @@ function runSearch() {
   es.onerror = function () {
     if (currentES !== es) return;
     es.close(); currentES = null; $('goBtn').disabled = false;
+    // 快速结果已经在页面上（深度扩展阶段断开）：结果仍可用，提示放进提示区，不再整页覆盖
+    if (fastShown) {
+      clearNotice('deepBanner');
+      setNotice('connBanner', '与本地服务的连接中断' + (deep ? '，深度扩展未完成' : '')
+        + '（当前结果仍可用；确认 app.py 仍在运行后可重新检索）', { level: 'error', dismissible: true });
+      return;
+    }
     setOverlay(true, { busy: false, msg: '连接中断',
                        sub: '与本地服务的连接断开了，确认 app.py 仍在运行后重试。' });
     showRestoreEntry();
@@ -1082,11 +1142,15 @@ function renderStatsBar() {
     if (s.enrich_status === 'degraded' || s.enrich_status === 'partial') {
       txt += ' · 补充已降级';
     }
-    $('degradeBanner').style.display = 'block';
-    $('degradeBanner').textContent = s.source_message || s.enrich_message
-      || '引用/机构补充已降级：配额用尽或接口失败（主图仍可用，详情与短名单会标缺口）';
+    // 数据源回退与补充降级说的不是同一件事时两句都显示（同一行内用「；」分隔）
+    var parts = [];
+    if (s.source_message) parts.push(s.source_message);
+    if (s.enrich_message && s.enrich_message !== s.source_message) parts.push(s.enrich_message);
+    setNotice('degradeBanner', parts.join('；')
+      || '引用/机构补充已降级：配额用尽或接口失败（主图仍可用，详情与短名单会标缺口）',
+      { level: 'warn', dismissible: true });
   } else {
-    $('degradeBanner').style.display = 'none';
+    clearNotice('degradeBanner');
   }
   $('stats').textContent = txt;
   $('stats').style.display = 'block';
