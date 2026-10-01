@@ -44,12 +44,13 @@ if os.path.isdir(_LIB_DIR):
 #   raw   ：抓到的原始论文 + OpenAlex 补充（关键词 + 论文数），切换时间范围时复用；单条最大
 #           （papers=2000 时几 MB），所以上限最小
 #   deep  ：深度模式结果
-# 上限可用环境变量覆盖（正整数）：TALENT_MAP_RESULT_CACHE_MAX / TALENT_MAP_RAW_CACHE_MAX /
-# TALENT_MAP_DEEP_CACHE_MAX；dblp 响应缓存见 topic_graph（TALENT_MAP_DBLP_CACHE_MAX）。
+# 上限可用环境变量覆盖：TALENT_MAP_RESULT_CACHE_MAX（1–1024）/ TALENT_MAP_RAW_CACHE_MAX（1–64）/
+# TALENT_MAP_DEEP_CACHE_MAX（1–512）；dblp 响应缓存见 topic_graph（TALENT_MAP_DBLP_CACHE_MAX，1–1024）。
 _CACHE_TTL = 30 * 60
-RESULT_CACHE_MAX = topic_graph.env_int("TALENT_MAP_RESULT_CACHE_MAX", 64)
-RAW_CACHE_MAX = topic_graph.env_int("TALENT_MAP_RAW_CACHE_MAX", 16)
-DEEP_CACHE_MAX = topic_graph.env_int("TALENT_MAP_DEEP_CACHE_MAX", 32)
+# 默认值与允许范围见 topic_graph.CACHE_LIMITS（超界封顶，非法值回落默认）
+RESULT_CACHE_MAX = topic_graph.cache_limit("TALENT_MAP_RESULT_CACHE_MAX")
+RAW_CACHE_MAX = topic_graph.cache_limit("TALENT_MAP_RAW_CACHE_MAX")
+DEEP_CACHE_MAX = topic_graph.cache_limit("TALENT_MAP_DEEP_CACHE_MAX")
 _RESULT_CACHE = topic_graph.TTLLRUCache(RESULT_CACHE_MAX, _CACHE_TTL, name="result")
 _RAW_CACHE = topic_graph.TTLLRUCache(RAW_CACHE_MAX, _CACHE_TTL, name="raw")
 _DEEP_CACHE = topic_graph.TTLLRUCache(DEEP_CACHE_MAX, _CACHE_TTL, name="deep")
@@ -358,18 +359,19 @@ PAGE = """<!DOCTYPE html>
               cursor: pointer; font-size: 12px; }
   .instItem:hover { background: #313244; }
   .instItem.active { background: #45475a; }
-  #deepBanner, #degradeBanner {
+  #deepBanner {
     position: absolute; left: 50%; transform: translateX(-50%);
     padding: 7px 16px; border-radius: 18px; font-size: 12px; z-index: 6; display: none;
     max-width: min(720px, 90vw); text-align: center;
-  }
-  #deepBanner {
     top: 16px;
     background: rgba(137,180,250,.14); border: 1px solid #89b4fa; color: #cdd6f4;
   }
+  /* 降级 / 备用源提示放在文档流里（范围条下方、结构图与短名单上方），占自己的一行；
+     不再用覆盖层浮在短名单工具栏上，挡住「导出 CSV」和筛选项 */
   #degradeBanner {
-    top: 52px;
-    background: rgba(249,226,175,.12); border: 1px solid #f9e2af; color: #f9e2af;
+    display: none; padding: 6px 22px; font-size: 12px; line-height: 1.5;
+    background: rgba(249,226,175,.10); border-bottom: 1px solid rgba(249,226,175,.45);
+    color: #f9e2af; word-break: break-word;
   }
   #presets { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
   .chip {
@@ -415,6 +417,7 @@ PAGE = """<!DOCTYPE html>
     background: #313244; color: #f9e2af; font-size: 11px;
   }
   .roleCore { color: #a6e3a1; }
+  td.citeGap { color: #f9e2af; cursor: help; }
   .roleCollab { color: #cba6f7; }
   .panel {
     position: absolute; background: rgba(30,30,46,.96); padding: 14px;
@@ -532,6 +535,7 @@ PAGE = """<!DOCTYPE html>
   <div id="presets"></div>
 </header>
 <div id="scopeBar"></div>
+<div id="degradeBanner" role="status"></div>
 
 <main>
   <div id="graph"></div>
@@ -589,7 +593,6 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div id="stats"></div>
   <div id="deepBanner"></div>
-  <div id="degradeBanner"></div>
   <div id="overlay">
     <div class="box">
       <div class="spinner hidden" id="spinner"></div>
@@ -643,9 +646,57 @@ function scholarSearchUrl(n) {
     + encodeURIComponent(q);
 }
 
+// 引用三态：ok（全部论文取到引用数据，0 就是真实的 0）/ partial（部分取到，数值为下限）/
+// missing（一篇都没取到：没 DOI、OpenAlex 未命中或补充降级）。界面、详情卡、短名单、复制摘要、
+// CSV 都走下面这组函数，保证口径一致。
+function citeStatus(n) {
+  if (n.citations === null || n.citations === undefined) return 'missing';
+  return n.citation_status === 'partial' ? 'partial' : 'ok';
+}
+
+function citePapers(n) {
+  var cp = n.citation_papers;
+  return (cp && cp.length === 2) ? (cp[0] + '/' + cp[1]) : '';
+}
+
+// 界面上显示的值：真实 0 显示 0；缺失显示「未补全」；部分缺失显示「≥N」
+function citationText(n) {
+  var st = citeStatus(n);
+  if (st === 'missing') return '未补全';
+  if (st === 'partial') return '≥' + n.citations;
+  return String(n.citations);
+}
+
+function citationNote(n) {
+  var st = citeStatus(n);
+  if (st === 'missing') return '未取到引用数据（论文缺 DOI、OpenAlex 未命中或补充降级），不代表 0 次';
+  if (st === 'partial') return '部分缺失：仅 ' + citePapers(n) + ' 篇论文取到引用数据，数值为已取到部分之和（下限）';
+  return '';
+}
+
+// CSV 里的值：缺失留空（原因写在缺口标记列），真实 0 写 0，部分缺失写已取到部分之和（下限）；
+// 部分缺失且已取到部分为 0 时也留空——下限 0 没有信息量，写 0 会被误读成真实被引 0 次
+function citationCsv(n) {
+  var st = citeStatus(n);
+  if (st === 'missing') return '';
+  if (st === 'partial' && !n.citations) return '';
+  return n.citations;
+}
+
+// 短名单 / CSV 排序：方向发文降序；同发文时有引用值的在前（按值降序），缺失统一排在后面
+function compareShortlist(a, b) {
+  if (b.papers !== a.papers) return b.papers - a.papers;
+  var am = citeStatus(a) === 'missing', bm = citeStatus(b) === 'missing';
+  if (am !== bm) return am ? 1 : -1;
+  if (am) return 0;
+  return b.citations - a.citations;
+}
+
 function gapMarkers(n) {
   var gaps = [];
-  if (!n.citations) gaps.push('缺引用');
+  var cst = citeStatus(n);
+  if (cst === 'missing') gaps.push('缺引用');
+  else if (cst === 'partial') gaps.push('引用部分缺失(' + citePapers(n) + '篇有数据)');
   if (!n.institution) gaps.push('缺署名机构');
   if (n.is_seed === false) gaps.push('非方向发文引入');
   return gaps;
@@ -689,10 +740,6 @@ function renderScopeBar() {
   $('thCites').textContent = '方向相关引用' + suffix;
 }
 
-function citationDisplay(n) {
-  // Missing enrichment must stay blank — do not show 0 as if it were a real count
-  return n.citations ? String(n.citations) : '';
-}
 
 fetch('/api/presets').then(function (r) { return r.json(); }).then(function (d) {
   (d.time_ranges || []).forEach(function (tr) {
@@ -935,8 +982,9 @@ function render(data) {
       ? '<b>' + n.label + '</b><br><i>经关联引入的合作者（不一定做该方向）</i>'
       : '<b>' + n.label + '</b><br>方向核心 · 该方向发文: ' + n.papers + ' 篇';
     var extra = '';
-    if (n.citations) extra += '<br>该方向相关引用: ' + n.citations + ' 次';
-    else extra += '<br>该方向相关引用: 未补全';
+    extra += '<br>该方向相关引用: ' + esc(citationText(n))
+      + (citeStatus(n) === 'missing' ? '' : ' 次')
+      + (citationNote(n) ? '<br><i>' + esc(citationNote(n)) + '</i>' : '');
     if (n.institution) extra += '<br>论文署名机构（发表当时）: ' + n.institution;
     else extra += '<br>论文署名机构: 未获取';
     if (n.topics && n.topics.length) extra += '<br>主题: ' + n.topics.join('、');
@@ -1020,7 +1068,9 @@ function renderStatsBar() {
         + s.relations + ' 条 · 独立网络 ' + s.components + ' 个 · 研究团体 ' + s.communities + ' 个';
   }
   if (s.enriched) {
-    txt += ' · 引用数 ' + s.with_citations + ' 人 / 署名机构 ' + s.with_institution + ' 人';
+    txt += ' · 引用数 ' + s.with_citations + ' 人'
+      + (s.with_citations_partial ? '（其中部分缺失 ' + s.with_citations_partial + ' 人，数值为下限）' : '')
+      + ' / 署名机构 ' + s.with_institution + ' 人';
   }
   if (s.data_source && s.data_source !== 'dblp') {
     txt += ' · 数据源 ' + s.data_source + '（备用）';
@@ -1053,7 +1103,7 @@ function computeSizes() {
   allNodes.forEach(function (n) {
     if (n.is_seed === false) { sizeById[n.id] = 10; return; }
     if (mode === 'citations') {
-      sizeById[n.id] = n.citations ? Math.round((12 + 28 * (n.citations / maxC)) * 10) / 10 : 9;
+      sizeById[n.id] = citeStatus(n) === 'missing' ? 9 : Math.round((12 + 28 * (n.citations / maxC)) * 10) / 10;
     } else {
       sizeById[n.id] = Math.round((12 + 28 * (n.papers / maxP)) * 10) / 10;
     }
@@ -1226,9 +1276,13 @@ function openDetail(id) {
   } else {
     html += field('该方向发文' + rSuffix, '—（经关联引入，非该方向检索命中）', '');
   }
+  var cst = citeStatus(n);
   html += field('该方向相关引用' + rSuffix,
-    n.citations ? (esc(n.citations) + ' 次') : '<span style="color:#f9e2af">未补全 / 缺引用</span>',
-    n.citations ? String(n.citations) : '');
+    cst === 'missing'
+      ? '<span style="color:#f9e2af">未补全</span><br><span style="color:#f9e2af;font-size:11px">' + esc(citationNote(n)) + '</span>'
+      : esc(citationText(n)) + ' 次'
+        + (cst === 'partial' ? '<br><span style="color:#f9e2af;font-size:11px">' + esc(citationNote(n)) + '</span>' : ''),
+    citationText(n));
   html += field('论文署名机构（发表当时）',
     n.institution ? esc(n.institution) : '<span style="color:#f9e2af">未获取（≠无单位）</span>',
     n.institution || '');
@@ -1285,7 +1339,7 @@ function openDetail(id) {
       '角色: ' + roleLabel(n),
       '时间范围: ' + rangeFullText(),
       '该方向发文: ' + (n.is_seed === false ? '' : n.papers),
-      '该方向相关引用: ' + citationDisplay(n),
+      '该方向相关引用: ' + citationText(n) + (citationNote(n) ? '（' + citationNote(n) + '）' : ''),
       '论文署名机构（发表当时）: ' + (n.institution || ''),
       '主题: ' + ((n.topics && n.topics.length) ? n.topics.join(', ') : ''),
       'dblp id: ' + n.id,
@@ -1357,10 +1411,7 @@ function refreshListClusterOptions() {
 }
 
 function renderShortlist() {
-  var rows = filteredNodes().slice().sort(function (a, b) {
-    if (b.papers !== a.papers) return b.papers - a.papers;
-    return (b.citations || 0) - (a.citations || 0);
-  });
+  var rows = filteredNodes().slice().sort(compareShortlist);
   $('listMeta').textContent = '显示 ' + rows.length + ' / ' + allNodes.length + ' 人 · 时间范围：' + currentRange().label;
   var body = $('listBody');
   body.innerHTML = '';
@@ -1377,7 +1428,8 @@ function renderShortlist() {
       '<td>' + esc(n.label) + '</td>'
       + '<td>' + esc(n.institution || '') + '</td>'
       + '<td>' + (n.is_seed === false ? '' : esc(n.papers)) + '</td>'
-      + '<td>' + esc(citationDisplay(n)) + '</td>'
+      + '<td' + (citeStatus(n) === 'ok' ? '' : ' class="citeGap" title="' + esc(citationNote(n)) + '"') + '>'
+        + esc(citationText(n)) + '</td>'
       + '<td class="' + (n.is_seed === false ? 'roleCollab' : 'roleCore') + '">' + esc(roleLabel(n)) + '</td>'
       + '<td>' + esc(n.community) + '</td>'
       + '<td><a href="' + esc(url) + '" target="_blank" rel="noopener">搜索页</a></td>'
@@ -1402,6 +1454,14 @@ function isoLocalTimestamp(d) {
     + sign + pad(Math.floor(off / 60)) + ':' + pad(off % 60);
 }
 
+// CSV 公式注入防护：文本列里以 = + - @ 制表符 回车 开头的单元格前面加单引号，
+// 表格软件会把它当文本而不是公式。只用于文本列；数字列（方向发文数、方向相关引用、团体/聚类ID）不经过这里。
+var CSV_FORMULA_START = /^[=+\\-@\\t\\r]/;
+function csvText(v) {
+  var s = String(v == null ? '' : v);
+  return CSV_FORMULA_START.test(s) ? "'" + s : s;
+}
+
 // RFC 4180：含逗号、双引号、CR、LF 的字段整体加双引号，内部双引号写成两个
 function csvCell(v) {
   var s = String(v == null ? '' : v);
@@ -1418,7 +1478,9 @@ function csvDisclaimer() {
   return '本短名单仅供学术结构探索与试用筛选；'
     + '论文署名机构（发表当时）反映论文元数据中的署名单位，不等于现职担保；'
     + 'Google Scholar 列为作者搜索页 URL，非精确个人主页，同名需人工甄别；'
-    + '方向相关引用/机构可能因 OpenAlex 配额用尽、接口失败或元数据缺口而缺失（留空，勿当作 0）；'
+    + '方向相关引用/机构可能因 OpenAlex 配额用尽、接口失败或元数据缺口而缺失：引用缺失时留空（勿当作 0），'
+    + '部分论文缺失时为已取到部分之和（下限，下限为 0 时留空），均在「数据置信/缺口标记」列注明；引用为 0 表示真实被引 0 次；'
+    + '文本列中以 = + - @ 制表符或回车开头的单元格已在前面加单引号，防止被当作公式执行；'
     + '时间范围口径：' + (tr.years ? tr.basis : '全部年份，不按年份过滤')
     + '，发文数、方向核心判定、合作关系、聚类、引用与排序均只统计该范围内论文'
     + (tr.years ? '（引用 = 范围内论文至今的累计被引）' : '');
@@ -1433,28 +1495,25 @@ function buildCsv(rows, exportedAt) {
   var lines = [CSV_HEADER.map(csvCell).join(',')];
   rows.forEach(function (n) {
     lines.push([
-      n.label,
-      n.institution || '',
-      n.is_seed === false ? '' : n.papers,
-      citationDisplay(n),          // 缺失留空，不填 0
-      roleLabel(n),
-      n.community,
-      scholarSearchUrl(n),
-      gapMarkers(n).join('; '),
-      rangeLabel,
-      query,
-      exportedAt,
-      disclaimer
+      csvText(n.label),
+      csvText(n.institution || ''),
+      n.is_seed === false ? '' : n.papers,   // 数字列，不转义
+      citationCsv(n),                         // 数字列：缺失留空，真实 0 写 0
+      csvText(roleLabel(n)),
+      n.community,                            // 数字列
+      csvText(scholarSearchUrl(n)),
+      csvText(gapMarkers(n).join('; ')),
+      csvText(rangeLabel),
+      csvText(query),
+      csvText(exportedAt),
+      csvText(disclaimer)
     ].map(csvCell).join(','));
   });
   return lines.join('\\r\\n') + '\\r\\n';
 }
 
 function exportCsv() {
-  var rows = filteredNodes().slice().sort(function (a, b) {
-    if (b.papers !== a.papers) return b.papers - a.papers;
-    return (b.citations || 0) - (a.citations || 0);
-  });
+  var rows = filteredNodes().slice().sort(compareShortlist);
   var text = buildCsv(rows, isoLocalTimestamp(new Date()));
   // UTF-8 BOM so Excel on Windows opens Chinese correctly
   var blob = new Blob(['\\ufeff' + text], { type: 'text/csv;charset=utf-8' });

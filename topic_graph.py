@@ -85,8 +85,10 @@ _DBLP_LAST = 0.0
 
 
 
-def env_int(name, default, minimum=1):
-    """读整数环境变量；未设置、非整数或小于 minimum 时用默认值。"""
+def env_int(name, default, minimum=1, maximum=None):
+    """
+    读整数环境变量：未设置或不是整数 → 用默认值；超出 [minimum, maximum] → 封顶到边界。
+    """
     raw = os.environ.get(name, "").strip()
     if not raw:
         return default
@@ -96,9 +98,27 @@ def env_int(name, default, minimum=1):
         print(f"[config] 环境变量 {name}={raw!r} 不是整数，改用默认值 {default}", flush=True)
         return default
     if value < minimum:
-        print(f"[config] 环境变量 {name}={value} 小于 {minimum}，改用默认值 {default}", flush=True)
-        return default
+        print(f"[config] 环境变量 {name}={value} 小于下限 {minimum}，按 {minimum} 处理", flush=True)
+        return minimum
+    if maximum is not None and value > maximum:
+        print(f"[config] 环境变量 {name}={value} 超过上限 {maximum}，按 {maximum} 处理", flush=True)
+        return maximum
     return value
+
+
+# 各缓存条目数上限：(默认值, 最小值, 最大值)。环境变量超界会被封顶，非法值回落默认。
+# raw（原始论文 + OpenAlex 补充）单条可达数 MB，所以上限最小。
+CACHE_LIMITS = {
+    "TALENT_MAP_RESULT_CACHE_MAX": (64, 1, 1024),
+    "TALENT_MAP_RAW_CACHE_MAX": (16, 1, 64),
+    "TALENT_MAP_DEEP_CACHE_MAX": (32, 1, 512),
+    "TALENT_MAP_DBLP_CACHE_MAX": (128, 1, 1024),
+}
+
+
+def cache_limit(name):
+    default, lo, hi = CACHE_LIMITS[name]
+    return env_int(name, default, minimum=lo, maximum=hi)
 
 
 class TTLLRUCache:
@@ -174,7 +194,7 @@ class TTLLRUCache:
 # 滚雪球（深度模式）的作者检索也走这份缓存，切换时间范围重跑深度模式时可复用。
 # 每条是一页 ≤100 条的 dblp JSON，内存开销很小。
 _DBLP_RESP_CACHE_TTL = 20 * 60
-_DBLP_RESP_CACHE_MAX = env_int("TALENT_MAP_DBLP_CACHE_MAX", 128)
+_DBLP_RESP_CACHE_MAX = cache_limit("TALENT_MAP_DBLP_CACHE_MAX")
 _DBLP_RESP_CACHE = TTLLRUCache(_DBLP_RESP_CACHE_MAX, _DBLP_RESP_CACHE_TTL, name="dblp")
 
 # Anubis（Techaro）保护：dblp 对疑似自动化流量返回 PoW 挑战页，浏览器解完后
@@ -603,9 +623,16 @@ def crossref_work_to_paper(work):
     }
 
 
+def _new_enrich_rec():
+    # cite_total：参与引用统计的论文数；cite_matched：其中真正取到引用数据的篇数。
+    # 两者用来区分「引用 0」与「引用缺失 / 部分缺失」，见 apply_enrichment。
+    return {"citations": 0, "institutions": Counter(), "topics": Counter(),
+            "cite_total": 0, "cite_matched": 0}
+
+
 def apply_inline_paper_meta(G, papers):
     """把 fallback 源自带的引用/机构/主题写进图（无需再打 OpenAlex enrich）。"""
-    per_pid = defaultdict(lambda: {"citations": 0, "institutions": Counter(), "topics": Counter()})
+    per_pid = defaultdict(_new_enrich_rec)
     for paper in papers:
         cites = int(paper.get("_citations") or 0)
         topics = paper.get("_topics") or []
@@ -613,6 +640,9 @@ def apply_inline_paper_meta(G, papers):
         for pid, name in parse_authors(paper):
             rec = per_pid[pid]
             rec["citations"] += cites
+            # 备用源的记录自带被引数（OpenAlex cited_by_count / Crossref is-referenced-by-count）
+            rec["cite_total"] += 1
+            rec["cite_matched"] += 1
             for t in topics:
                 rec["topics"][t] += 1
             for inst in (meta.get(pid) or {}).get("institutions") or []:
@@ -794,7 +824,8 @@ def enrich_from_openalex(papers, on_progress=None):
     aggregate_openalex_works（纯本地，按任意论文子集聚合）。时间范围筛选靠第二步
     在不重新请求 OpenAlex 的前提下，只用范围内论文重算引用/机构/主题。
 
-    返回 {dblp_pid: {"citations": int, "institutions": Counter, "topics": Counter}}
+    返回 {dblp_pid: {"citations": int, "institutions": Counter, "topics": Counter,
+                     "cite_total": int, "cite_matched": int}}
     """
     works_by_doi, coverage = fetch_openalex_works(papers, on_progress)
     return aggregate_openalex_works(papers, works_by_doi), coverage
@@ -914,7 +945,8 @@ def fetch_openalex_works(papers, on_progress=None):
 def aggregate_openalex_works(papers, works_by_doi):
     """
     纯本地：只用传入的这批论文（例如时间范围内的论文）聚合每位作者的引用/机构/主题。
-    没匹配上 OpenAlex 的论文不贡献任何值——引用保持 0，前端据此留空、不当作真实的 0。
+    没匹配上 OpenAlex 的论文不贡献任何值，并记入 cite_total 但不计 cite_matched；
+    apply_enrichment 据此区分 真实 0 / 部分缺失（下限）/ 完全缺失（None）。
     """
     by_doi = {}
     for p in papers:
@@ -925,7 +957,7 @@ def aggregate_openalex_works(papers, works_by_doi):
     works = sorted(((w["seq"], doi, w) for doi in by_doi for w in works_by_doi.get(doi) or ()),
                    key=lambda x: x[0])
 
-    enriched = defaultdict(lambda: {"citations": 0, "institutions": Counter(), "topics": Counter()})
+    enriched = defaultdict(_new_enrich_rec)
     for _, doi, work in works:
         for dblp_paper in by_doi[doi]:
             for pid, name in parse_authors(dblp_paper):
@@ -937,6 +969,16 @@ def aggregate_openalex_works(papers, works_by_doi):
                 if insts:
                     for inst in insts:
                         rec["institutions"][inst] += 1
+    # 引用覆盖：每位作者在这批论文里有几篇取到了 OpenAlex 记录。没 DOI、OpenAlex 没命中、
+    # 所在批次失败（429 等）的论文都算「没取到」；命中但 cited_by_count=0 算取到、值为 0。
+    for p in papers:
+        doi = (p.get("info", {}).get("doi") or "").lower()
+        hit = bool(doi and works_by_doi.get(doi))
+        for pid, _ in parse_authors(p):
+            rec = enriched[pid]
+            rec["cite_total"] += 1
+            if hit:
+                rec["cite_matched"] += 1
     return dict(enriched)
 
 
@@ -994,9 +1036,11 @@ def build_network(papers, min_papers):
 
     G = nx.Graph()
     for pid in kept:
+        # 引用默认「缺失」（None），只有真正取到引用数据才会被 apply_enrichment 改成数字（含 0）
         G.add_node(pid, label=author_names[pid],
                    papers=paper_count[pid], samples=author_papers[pid],
-                   citations=0, institution="", topics=[])
+                   citations=None, citation_status="missing", citation_papers=None,
+                   institution="", topics=[])
     for (a, b), w in coauthor_count.items():
         if a in kept and b in kept:
             G.add_edge(a, b, weight=w)
@@ -1005,11 +1049,28 @@ def build_network(papers, min_papers):
 
 
 def apply_enrichment(G, enriched):
-    """把 OpenAlex 补充到的引用量 / 机构 / 主题写进图的节点属性。"""
+    """
+    把 OpenAlex 补充到的引用量 / 机构 / 主题写进图的节点属性。
+
+    引用口径（区分 0 与缺失）：
+      ok      —— 参与统计的论文全部取到引用数据：citations = 总和（真实 0 就是 0）
+      partial —— 只有部分论文取到：citations = 已取到部分之和，视为「下限」，界面标「≥」并注明 x/y 篇
+      missing —— 一篇都没取到（没 DOI / OpenAlex 未命中 / 补充降级）：citations = None，界面显示「未补全」
+    citation_papers = [取到引用数据的篇数, 参与统计的篇数]
+    """
     for pid, rec in enriched.items():
         if pid not in G:
             continue
-        G.nodes[pid]["citations"] = rec["citations"]
+        node = G.nodes[pid]
+        total = rec.get("cite_total", 0)
+        matched = rec.get("cite_matched", 0)
+        if matched > 0:
+            node["citations"] = rec["citations"]
+            node["citation_status"] = "ok" if matched >= total else "partial"
+        else:
+            node["citations"] = None
+            node["citation_status"] = "missing"
+        node["citation_papers"] = [matched, total]
         if rec["institutions"]:
             # 一个人可能在不同论文署不同单位（换过工作、双聘），取出现次数最多的那个
             G.nodes[pid]["institution"] = rec["institutions"].most_common(1)[0][0]
@@ -1073,7 +1134,10 @@ def graph_to_payload(G, node_community, node_color, legend):
             "papers": attrs["papers"],
             "samples": attrs["samples"],
             "is_seed": is_seed,
-            "citations": attrs.get("citations", 0),
+            "citations": attrs.get("citations"),          # None = 缺失，0 = 真实被引 0 次
+            "citation_status": attrs.get("citation_status")
+                               or ("missing" if attrs.get("citations") is None else "ok"),
+            "citation_papers": attrs.get("citation_papers"),
             "institution": attrs.get("institution", ""),
             "topics": attrs.get("topics", []),
             "community": node_community[node],
@@ -1139,7 +1203,9 @@ def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None, time_range=
         # 把补充来的引用量/机构/主题一并带过去，否则深度模式会把这些数据丢掉
         S.add_node(pid, label=d["label"], papers=d["papers"],
                    samples=d["samples"], is_seed=True,
-                   citations=d.get("citations", 0),
+                   citations=d.get("citations"),
+                   citation_status=d.get("citation_status", "missing"),
+                   citation_papers=d.get("citation_papers"),
                    institution=d.get("institution", ""),
                    topics=d.get("topics", []))
 
@@ -1173,7 +1239,8 @@ def snowball_expand(G, seed_count=15, per_seed=15, on_progress=None, time_range=
         for p, w in collab.most_common(per_seed):
             if p not in S:
                 S.add_node(p, label=names[p], papers=0, samples=[], is_seed=False,
-                           citations=0, institution="", topics=[])
+                           citations=None, citation_status="missing", citation_papers=None,
+                           institution="", topics=[])
             S.add_edge(pid, p, weight=w)
 
         # 种子之间的间隔同样交给 dblp_get 的全局节流
@@ -1209,6 +1276,25 @@ def fetch_topic_papers(query, max_papers=300, on_progress=None, enrich=True):
     return raw
 
 
+# 三档（含「全部」）都没有结果时的建议：这时再提示「切换到更宽的时间范围」没有意义
+NO_RESULT_ADVICE = ("建议减少关键词（dblp 多个关键词之间是 AND，词越多结果越少）、"
+                    "换近义词，或调高检索论文数")
+
+
+def _any_author_meets(papers, min_papers):
+    """与 build_network 同一口径（跳过超大作者列表的论文），判断是否有人发文数 ≥ min_papers。"""
+    count = Counter()
+    for paper in papers:
+        authors = parse_authors(paper)
+        if not authors or len(authors) > MAX_AUTHORS_PER_PAPER:
+            continue
+        for pid, _ in authors:
+            count[pid] += 1
+            if count[pid] >= min_papers:
+                return True
+    return False
+
+
 def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
     """
     纯本地部分：按时间范围过滤已抓到的论文 -> 建图 -> 写入补充属性 -> 聚类 -> 前端 JSON。
@@ -1225,11 +1311,20 @@ def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
     if not all_papers:
         detail = source_message or "所有数据源均无结果"
         return {"error": f"没有检索到「{query}」相关论文。{detail}。"
-                         f"dblp 多个关键词之间是 AND 关系，建议只用 1~2 个核心词；"
-                         f"若长期失败可配置 OPENALEX_API_KEY 启用 OpenAlex 备用源。"}
+                         f"dblp 多个关键词之间是 AND 关系，建议只用 1~2 个核心词，或换近义词；"
+                         f"若长期失败可配置 OPENALEX_API_KEY 启用 OpenAlex 备用源。",
+                "error_kind": "no_results"}
+
+    # 「全部年份」是否有结果：决定空结果时该建议「切到更宽范围」还是「改关键词」
+    all_has_results = _any_author_meets(all_papers, min_papers)
 
     papers, range_counts = filter_papers_by_time_range(all_papers, tr)
     if not papers:
+        if not all_has_results:
+            return {"error": f"已抓取 {len(all_papers)} 篇「{query}」相关论文，但时间范围"
+                             f"「{tr['label']}」内没有论文；即使看全部年份，也没有人在该方向发过 "
+                             f"{min_papers} 篇以上。{NO_RESULT_ADVICE}，或调低「最少发文数」。",
+                    "error_kind": "no_results"}
         return {"error": f"已抓取 {len(all_papers)} 篇「{query}」相关论文，但时间范围"
                          f"「{tr['label']}」内没有论文（{tr['basis']}）。"
                          f"可以切换到更宽的时间范围，或调高检索论文数。",
@@ -1241,11 +1336,16 @@ def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
     G, total_authors, skipped = build_network(papers, min_papers)
 
     if G.number_of_nodes() == 0:
+        if tr["years"] is not None and all_has_results:
+            return {"error": f"这批论文在时间范围「{tr['label']}」内涉及 {total_authors} 位作者，"
+                             f"但没有人在该方向发过 {min_papers} 篇以上。可以调低「最少发文数」，"
+                             f"或调高检索论文数，或切换到更宽的时间范围。",
+                    "error_kind": "empty_range"}
         scope = "" if tr["years"] is None else f"在时间范围「{tr['label']}」内"
+        also = "" if tr["years"] is None else "即使看全部年份也是如此。"
         return {"error": f"这批论文{scope}涉及 {total_authors} 位作者，但没有人在该方向发过 "
-                         f"{min_papers} 篇以上。可以调低「最少发文数」，或调高检索论文数"
-                         + ("，或切换到更宽的时间范围。" if tr["years"] is not None else "。"),
-                "error_kind": "empty_range" if tr["years"] is not None else "below_threshold"}
+                         f"{min_papers} 篇以上。{also}{NO_RESULT_ADVICE}，或调低「最少发文数」。",
+                "error_kind": "no_results"}
 
     coverage = {
         "enrich_status": "skipped",
@@ -1275,7 +1375,9 @@ def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
 
     payload = graph_to_payload(G, node_community, node_color, legend)
     with_inst = sum(1 for _, d in G.nodes(data=True) if d.get("institution"))
-    with_cite = sum(1 for _, d in G.nodes(data=True) if d.get("citations"))
+    # 「有引用数据」= 取到了引用数（含真实 0、含部分缺失）；缺失（None）不算
+    with_cite = sum(1 for _, d in G.nodes(data=True) if d.get("citations") is not None)
+    with_cite_partial = sum(1 for _, d in G.nodes(data=True) if d.get("citation_status") == "partial")
     payload["stats"] = {
         "query": query,
         "papers_fetched": len(all_papers),
@@ -1293,6 +1395,7 @@ def build_topic_payload(raw, min_papers=2, time_range=None, on_progress=None):
         "enriched": bool(enrich) or source in ("openalex", "crossref"),
         "with_institution": with_inst,
         "with_citations": with_cite,
+        "with_citations_partial": with_cite_partial,
         "data_source": source,
         "source_message": source_message,
         **coverage,
@@ -1360,7 +1463,9 @@ def deep_expand(fast_payload, seed_count=15, per_seed=15, on_progress=None):
         # 覆盖率要按扩展后的图重算：滚雪球带进来的合作者没有这些补充数据，
         # 沿用快速阶段的数字会虚报
         "with_institution": sum(1 for _, d in S.nodes(data=True) if d.get("institution")),
-        "with_citations": sum(1 for _, d in S.nodes(data=True) if d.get("citations")),
+        "with_citations": sum(1 for _, d in S.nodes(data=True) if d.get("citations") is not None),
+        "with_citations_partial": sum(1 for _, d in S.nodes(data=True)
+                                      if d.get("citation_status") == "partial"),
     }
     payload["error"] = None
     return payload

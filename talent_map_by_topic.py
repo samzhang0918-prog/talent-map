@@ -271,8 +271,15 @@ def render(payload, topic, out_file):
                 if n.get("is_seed") is False
                 else f"<b>{n['label']}</b><br>该方向发文: {n['papers']} 篇")
         extra = ""
-        if n.get("citations"):
-            extra += f"<br>该方向被引: {n['citations']} 次"
+        # 引用三态与网页一致：真实 0 显示 0；缺失显示「未补全」；部分缺失显示「≥N」并注明 x/y 篇
+        cites, cst, cp = n.get("citations"), n.get("citation_status"), n.get("citation_papers")
+        if cites is None:
+            extra += "<br>该方向被引: 未补全（未取到引用数据，不代表 0 次）"
+        elif cst == "partial" and cp:
+            extra += (f"<br>该方向被引: ≥{cites} 次（仅 {cp[0]}/{cp[1]} 篇论文取到引用数据，"
+                      f"数值为下限）")
+        else:
+            extra += f"<br>该方向被引: {cites} 次"
         if n.get("institution"):
             extra += f"<br>机构: {n['institution']}"
         if n.get("topics"):

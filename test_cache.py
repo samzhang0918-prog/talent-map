@@ -138,15 +138,57 @@ print("ok")
     assert r.returncode == 0 and r.stdout.strip().endswith("ok"), r.stdout + r.stderr
 
 
-def test_env_int_rejects_bad_values():
-    os.environ["TM_TEST_INT"] = "abc"
-    assert tg.env_int("TM_TEST_INT", 7) == 7
-    os.environ["TM_TEST_INT"] = "0"
-    assert tg.env_int("TM_TEST_INT", 7) == 7
+def test_env_int_clamps_and_falls_back():
+    os.environ["TM_TEST_INT"] = "abc"                       # 非整数 -> 默认值
+    assert tg.env_int("TM_TEST_INT", 7, 1, 100) == 7
+    os.environ["TM_TEST_INT"] = "1.5"
+    assert tg.env_int("TM_TEST_INT", 7, 1, 100) == 7
+    os.environ["TM_TEST_INT"] = "0"                         # 低于下限 -> 封顶到下限
+    assert tg.env_int("TM_TEST_INT", 7, 1, 100) == 1
+    os.environ["TM_TEST_INT"] = "-5"
+    assert tg.env_int("TM_TEST_INT", 7, 1, 100) == 1
+    os.environ["TM_TEST_INT"] = "100000"                    # 超过上限 -> 封顶到上限
+    assert tg.env_int("TM_TEST_INT", 7, 1, 100) == 100
     os.environ["TM_TEST_INT"] = " 12 "
-    assert tg.env_int("TM_TEST_INT", 7) == 12
-    del os.environ["TM_TEST_INT"]
-    assert tg.env_int("TM_TEST_INT", 7) == 7
+    assert tg.env_int("TM_TEST_INT", 7, 1, 100) == 12
+    del os.environ["TM_TEST_INT"]                           # 未设置 -> 默认值
+    assert tg.env_int("TM_TEST_INT", 7, 1, 100) == 7
+
+
+def test_cache_limit_table():
+    assert tg.CACHE_LIMITS == {
+        "TALENT_MAP_RESULT_CACHE_MAX": (64, 1, 1024),
+        "TALENT_MAP_RAW_CACHE_MAX": (16, 1, 64),
+        "TALENT_MAP_DEEP_CACHE_MAX": (32, 1, 512),
+        "TALENT_MAP_DBLP_CACHE_MAX": (128, 1, 1024),
+    }
+
+
+def _app_limits(env_extra):
+    code = ("import app, topic_graph as tg; print(app._RESULT_CACHE.maxsize, app._RAW_CACHE.maxsize, "
+            "app._DEEP_CACHE.maxsize, tg._DBLP_RESP_CACHE.maxsize)")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TALENT_MAP_")}
+    env.update(env_extra)
+    r = subprocess.run([sys.executable, "-c", code], cwd=HERE, env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return tuple(int(x) for x in r.stdout.split()[-4:]), r.stdout
+
+
+def test_app_cache_limits_capped_from_env():
+    """四个环境变量：超上限封顶、低于下限封到下限、非法值回落默认、未设置用默认。"""
+    got, _ = _app_limits({})
+    assert got == (64, 16, 32, 128)
+    got, out = _app_limits({"TALENT_MAP_RESULT_CACHE_MAX": "999999", "TALENT_MAP_RAW_CACHE_MAX": "5000",
+                            "TALENT_MAP_DEEP_CACHE_MAX": "100000", "TALENT_MAP_DBLP_CACHE_MAX": "1e9"})
+    assert got == (1024, 64, 512, 128), got          # 1e9 不是整数 -> 默认 128
+    assert "超过上限" in out and "不是整数" in out
+    got, _ = _app_limits({"TALENT_MAP_RESULT_CACHE_MAX": "0", "TALENT_MAP_RAW_CACHE_MAX": "-3",
+                          "TALENT_MAP_DEEP_CACHE_MAX": "abc", "TALENT_MAP_DBLP_CACHE_MAX": "2048"})
+    assert got == (1, 1, 32, 1024), got
+    got, _ = _app_limits({"TALENT_MAP_RESULT_CACHE_MAX": "200", "TALENT_MAP_RAW_CACHE_MAX": "64",
+                          "TALENT_MAP_DEEP_CACHE_MAX": "1", "TALENT_MAP_DBLP_CACHE_MAX": "1024"})
+    assert got == (200, 64, 1, 1024), got           # 边界值与范围内的值原样生效
 
 
 if __name__ == "__main__":
